@@ -81,14 +81,33 @@ def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_inst
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "remediations.json").write_text(json.dumps(remediations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     gate = evaluate(findings, config["policy"], remediations)
-    summary = _summary(findings, remediations, gate)
+    active_scanners = [result for result in scanner_results if result["status"] not in {"skipped", "not_applicable"}]
+    successful_scanners = [
+        result for result in active_scanners
+        if result["status"] in {"clean", "completed", "completed_with_findings"}
+    ]
+    failed_scanners = [result for result in active_scanners if result not in successful_scanners]
+    execution_status = "completed" if active_scanners and not failed_scanners else "incomplete"
+    if execution_status == "incomplete":
+        if not active_scanners:
+            incomplete_reason = "No applicable scanners were executed; security assessment is indeterminate."
+        else:
+            failed_names = ", ".join(result["name"] for result in failed_scanners)
+            incomplete_reason = f"Scanner execution incomplete ({failed_names}); security assessment is indeterminate."
+        gate = {
+            **gate,
+            "policyStatus": gate["status"],
+            "status": "indeterminate",
+            "reason": incomplete_reason,
+        }
+    summary = _summary(findings, remediations, gate, execution_status)
     (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     finished = datetime.now(timezone.utc)
     scan_report = {
         "scanId": scan_id,
-        "status": "completed",
-        "executionStatus": "completed",
+        "status": execution_status,
+        "executionStatus": execution_status,
         "securityGate": gate,
         "generator": {"name": "Vesper", "version": __version__},
         "startedAt": started.isoformat(),
@@ -97,13 +116,17 @@ def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_inst
     }
     (output / "scan.json").write_text(json.dumps(scan_report, indent=2) + "\n", encoding="utf-8")
     _print_summary(project.technologies, summary, remediations, scanner_results)
-    executed = [result for result in scanner_results if result["status"] not in {"skipped", "not_applicable"}]
-    if executed and all(result["status"] in {"failed", "timeout"} for result in executed):
+    if execution_status != "completed":
         return EXIT_RUNNER_FAILED, scan_report
     return (EXIT_GATE_FAILED if gate["status"] == "failed" else 0), scan_report
 
 
-def _summary(findings: list[dict[str, Any]], remediations: list[dict[str, Any]], gate: dict[str, Any]) -> dict[str, Any]:
+def _summary(
+    findings: list[dict[str, Any]],
+    remediations: list[dict[str, Any]],
+    gate: dict[str, Any],
+    execution_status: str,
+) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
     category_severity = {category: dict.fromkeys(severities, 0) for category in categories}
@@ -116,7 +139,7 @@ def _summary(findings: list[dict[str, Any]], remediations: list[dict[str, Any]],
         priorities[remediation["priority"]] += 1
     return {
         "generator": {"name": "Vesper", "version": __version__},
-        "status": "completed",
+        "status": execution_status,
         "total": len(findings),
         "severity": severities,
         "categories": categories,

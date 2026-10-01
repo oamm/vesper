@@ -37,6 +37,7 @@ class ScannerResult:
     error: str | None = None
     reason: str | None = None
     finding_count: int = 0
+    schema_version: str | None = None
 
     def report(self) -> dict[str, Any]:
         return {
@@ -50,6 +51,7 @@ class ScannerResult:
             "error": self.error,
             "reason": self.reason,
             "findingCount": self.finding_count,
+            "schemaVersion": self.schema_version,
         }
 
 

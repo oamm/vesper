@@ -99,7 +99,7 @@ def _normalize_osv(raw: Any) -> list[dict[str, Any]]:
                 aliases = item.get("aliases") or item.get("Aliases") or []
                 vuln_id = item.get("id") or item.get("ID") or "vulnerability"
                 cve = sorted({value for value in [vuln_id, *aliases] if str(value).startswith("CVE-")})
-                findings.append(_finding(
+                finding = _finding(
                     "dependency", vuln_id, item.get("summary") or item.get("Summary") or vuln_id,
                     item.get("details") or item.get("Details"), _osv_severity(item), "osv-scanner", vuln_id,
                     path, None, None, [], cve, _osv_cvss(item), {
@@ -108,7 +108,11 @@ def _normalize_osv(raw: Any) -> list[dict[str, Any]]:
                         "fixedVersion": None,
                         "ecosystem": _ecosystem(package.get("ecosystem") or package.get("Ecosystem")),
                     }, item.get("details") or item.get("summary"), vuln_id,
-                ))
+                )
+                vectors = _osv_cvss_vectors(item)
+                if vectors:
+                    finding["security"]["cvssVector"] = vectors[0] if len(vectors) == 1 else vectors
+                findings.append(finding)
     return findings
 
 
@@ -246,26 +250,48 @@ def _impact_type(category: str, cwes: list[str], title: Any, description: Any) -
 
 
 def _osv_severity(item: dict[str, Any]) -> str:
-    severities = item.get("database_specific", {}).get("severity") if isinstance(item.get("database_specific"), dict) else None
-    if not severities:
-        severities = item.get("severity")
-    if isinstance(severities, list):
-        for entry in severities:
-            if isinstance(entry, dict) and entry.get("type", "").upper().startswith("CVSS"):
-                score = re.search(r"\d+(?:\.\d+)?", str(entry.get("score", "")))
-                if score:
-                    return _cvss_severity(float(score.group(0)))
-        return "unknown"
-    return normalize_severity(severities)
+    database_severity = item.get("database_specific", {}).get("severity") if isinstance(item.get("database_specific"), dict) else None
+    normalized_database_severity = normalize_severity(database_severity)
+    if normalized_database_severity != "unknown":
+        return normalized_database_severity
+
+    for entry in item.get("severity") or []:
+        if not isinstance(entry, dict) or not entry.get("type", "").upper().startswith("CVSS"):
+            continue
+        score = _numeric_cvss_score(entry.get("score"))
+        if score is not None:
+            return _cvss_severity(score)
+    return "unknown"
 
 
 def _osv_cvss(item: dict[str, Any]) -> float | None:
     for entry in item.get("severity") or []:
-        if isinstance(entry, dict):
-            score = re.search(r"\d+(?:\.\d+)?", str(entry.get("score", "")))
-            if score and entry.get("type", "").upper().startswith("CVSS"):
-                return float(score.group(0))
+        if isinstance(entry, dict) and entry.get("type", "").upper().startswith("CVSS"):
+            score = _numeric_cvss_score(entry.get("score"))
+            if score is not None:
+                return score
     return None
+
+
+def _numeric_cvss_score(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        score = float(value)
+        return score if 0.0 <= score <= 10.0 else None
+    if isinstance(value, str) and re.fullmatch(r"\s*(?:10(?:\.0+)?|[0-9](?:\.\d+)?)\s*", value):
+        return float(value.strip())
+    return None
+
+
+def _osv_cvss_vectors(item: dict[str, Any]) -> list[str]:
+    vectors = []
+    for entry in item.get("severity") or []:
+        if isinstance(entry, dict) and entry.get("type", "").upper().startswith("CVSS"):
+            score = entry.get("score")
+            if isinstance(score, str) and (score.startswith("CVSS:") or score.startswith("AV:") or "/AV:" in score):
+                vectors.append(score)
+    return sorted(set(vectors))
 
 
 def _cvss_severity(score: float) -> str:

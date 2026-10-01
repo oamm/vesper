@@ -33,6 +33,9 @@ class Scanner(ABC):
     def command(self, context: ScannerContext) -> list[str]:
         raise NotImplementedError
 
+    def validate_schema(self, raw: dict[str, Any]) -> str | None:
+        raise ValueError("scanner has no supported output schema validator")
+
     def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
         output_name = self.output_name or self.name
         raw_path = context.raw_dir / f"{output_name}.json"
@@ -45,6 +48,9 @@ class Scanner(ABC):
         reason = None
         raw: Any = {}
         version = self._version()
+        process_returncode: int | None = None
+        parsed_successfully = False
+        schema_version = None
 
         if not self.enabled:
             status = "skipped"
@@ -54,20 +60,29 @@ class Scanner(ABC):
             reason = "not applicable to detected project"
         else:
             try:
-                output, stderr, returncode = _run_process(self.command(context), context.workspace, context.timeout_seconds)
+                output, stderr, process_returncode = _run_process(
+                    self.command(context), context.workspace, context.timeout_seconds
+                )
                 try:
-                    raw = json.loads(output) if output.strip() else {}
+                    if not output.strip():
+                        raise json.JSONDecodeError("empty scanner output", output, 0)
+                    raw = json.loads(output)
                 except json.JSONDecodeError:
-                    raw = {"_runner": {"message": "Scanner did not emit valid JSON", "returnCode": returncode}}
-                    error = "scanner output was not valid JSON"
-                findings = normalize(self.name, raw) if isinstance(raw, dict) else []
-                if returncode == 1 and findings:
-                    status = "completed_with_findings"
-                elif returncode != 0:
                     status = "failed"
-                    error = f"scanner exited with code {returncode}"
-                if stderr and status == "failed":
-                    error = f"{error}: {_safe_text(stderr[-500:]).strip()}"
+                    error = "scanner emitted empty or invalid JSON"
+                    raw = {"_runner": {"message": error, "returnCode": process_returncode}}
+                else:
+                    if not isinstance(raw, dict):
+                        status = "failed"
+                        error = "scanner JSON root must be an object"
+                        raw = {"_runner": {"message": error, "rootType": type(raw).__name__}}
+                    else:
+                        try:
+                            schema_version = self.validate_schema(raw)
+                            parsed_successfully = True
+                        except ValueError as exc:
+                            status = "failed"
+                            error = str(exc)
             except ScanTimeout:
                 status = "timeout"
                 error = f"scanner exceeded {context.timeout_seconds}s timeout"
@@ -79,15 +94,34 @@ class Scanner(ABC):
 
         safe_raw = sanitize_data(raw)
         raw_path.write_text(json.dumps(safe_raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        findings = normalize(self.name, safe_raw) if status in {"completed", "completed_with_findings", "failed"} else []
-        if status == "completed":
-            status = "completed_with_findings" if findings else "clean"
+        findings: list[dict[str, Any]] = []
+        if parsed_successfully:
+            try:
+                findings = normalize(self.name, safe_raw)
+            except Exception as exc:
+                status = "failed"
+                error = f"scanner result normalization failed ({type(exc).__name__})"
+
+        if parsed_successfully and status != "failed":
+            if process_returncode == 0:
+                status = "completed_with_findings" if findings else "clean"
+            elif process_returncode == 1 and findings:
+                status = "completed_with_findings"
+            else:
+                status = "failed"
+                error = f"scanner exited with code {process_returncode}"
+
+        if status == "failed" and process_returncode not in (None, 0) and error:
+            error = f"{error} (exit code {process_returncode})"
+        if status == "failed" and 'stderr' in locals() and stderr:
+            error = f"{error}: {_safe_text(stderr[-500:]).strip()}"
         finished = datetime.now(timezone.utc)
         duration = int((time.monotonic() - started_clock) * 1000)
         result = ScannerResult(
             name=self.name, version=version, status=status, started_at=started.isoformat(),
             finished_at=finished.isoformat(), duration_ms=duration, raw_output=raw_relative, error=error,
             reason=reason, finding_count=len(findings),
+            schema_version=schema_version,
         )
         if status in {"clean", "completed_with_findings"}:
             print(f"[{self.name}] Completed in {duration / 1000:.1f}s", flush=True)
@@ -113,6 +147,21 @@ class TrivyScanner(Scanner):
     def can_run(self, context: ScannerContext) -> bool:
         return context.project.has_files
 
+    def validate_schema(self, raw: dict[str, Any]) -> str:
+        results = raw.get("Results")
+        if (
+            raw.get("SchemaVersion") != 2
+            or not isinstance(raw.get("ArtifactName"), str)
+            or not isinstance(raw.get("ArtifactType"), str)
+            or not isinstance(raw.get("CreatedAt"), str)
+            or not isinstance(raw.get("Metadata"), dict)
+            or ("Results" in raw and results is not None and not isinstance(results, list))
+        ):
+            raise ValueError("scanner output schema is unsupported (expected Trivy v2 artifact metadata and optional Results array)")
+        if any(not isinstance(result, dict) or not isinstance(result.get("Target"), str) for result in results or []):
+            raise ValueError("scanner output schema is unsupported (Trivy Results entries must contain a Target string)")
+        return str(raw["SchemaVersion"])
+
     def command(self, context: ScannerContext) -> list[str]:
         skipped_dirs = [".git", "node_modules", "bin", "obj", "dist", "build", "artifacts", "coverage", "target", "security-results"]
         skipped_dirs.extend(path for path in context.exclude_paths if path not in skipped_dirs)
@@ -132,6 +181,24 @@ class OsvScanner(Scanner):
     def can_run(self, context: ScannerContext) -> bool:
         return bool(context.project.lockfiles)
 
+    def validate_schema(self, raw: dict[str, Any]) -> str | None:
+        results = raw.get("results")
+        if not isinstance(results, list):
+            raise ValueError("scanner output schema is unsupported (expected OSV results array)")
+        if any(
+            not isinstance(result, dict)
+            or not isinstance(result.get("source"), dict)
+            or not isinstance(result.get("packages"), list)
+            for result in results
+        ):
+            raise ValueError("scanner output schema is unsupported (OSV results require source and packages)")
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict):
+            version = metadata.get("schemaVersion") or metadata.get("schema_version")
+            if isinstance(version, (str, int)) and not isinstance(version, bool):
+                return str(version)
+        return None
+
     def command(self, context: ScannerContext) -> list[str]:
         return ["osv-scanner", "scan", "source", "--recursive", "--format", "json", str(context.workspace)]
 
@@ -142,6 +209,15 @@ class SastScanner(Scanner):
 
     def can_run(self, context: ScannerContext) -> bool:
         return context.project.has_source
+
+    def validate_schema(self, raw: dict[str, Any]) -> str:
+        if not isinstance(raw.get("version"), str) or not raw["version"]:
+            raise ValueError("scanner output schema is unsupported (expected Semgrep version string)")
+        if not isinstance(raw.get("results"), list) or not isinstance(raw.get("errors"), list):
+            raise ValueError("scanner output schema is unsupported (expected Semgrep results and errors arrays)")
+        if any(not isinstance(result, dict) for result in raw["results"]):
+            raise ValueError("scanner output schema is unsupported (Semgrep results entries must be objects)")
+        return raw["version"]
 
     def command(self, context: ScannerContext) -> list[str]:
         command = [

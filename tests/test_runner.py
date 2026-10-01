@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from security_runner.detection import detect_project
 from security_runner.models import ScannerContext, ScannerResult
@@ -201,6 +202,41 @@ class RemediationTests(unittest.TestCase):
         self.assertIsNone(remediation["package"]["targetVersion"])
         self.assertEqual(remediation["package"]["candidateFixedVersions"], ["0.2.4", "2.3.1"])
 
+    def test_osv_cvss_numeric_scores_and_vectors(self):
+        numeric = normalize("osv-scanner", {"results": [{"source": {"path": "requirements.txt"}, "packages": [{
+            "package": {"name": "pkg", "version": "1"},
+            "vulnerabilities": [{"id": "OSV-NUM", "severity": [{"type": "CVSS_V3", "score": 9.8}]}],
+        }]}]})[0]
+        self.assertEqual(numeric["security"]["cvss"], 9.8)
+        self.assertEqual(numeric["severity"], "critical")
+
+        numeric_string = normalize("osv-scanner", {"results": [{"source": {"path": "requirements.txt"}, "packages": [{
+            "package": {"name": "pkg", "version": "1"},
+            "vulnerabilities": [{"id": "OSV-STR", "severity": [{"type": "CVSS_V3", "score": "7.5"}]}],
+        }]}]})[0]
+        self.assertEqual(numeric_string["security"]["cvss"], 7.5)
+        self.assertEqual(numeric_string["severity"], "high")
+
+        for vulnerability_id, vector in (
+            ("OSV-V31", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            ("OSV-V30", "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            ("OSV-V2", "AV:N/AC:L/Au:N/C:C/I:C/A:C"),
+            ("OSV-BAD", "CVSS:3.1/not-a-vector"),
+        ):
+            finding = normalize("osv-scanner", {"results": [{"source": {"path": "requirements.txt"}, "packages": [{
+                "package": {"name": "pkg", "version": "1"},
+                "vulnerabilities": [{"id": vulnerability_id, "severity": [{"type": "CVSS_V3", "score": vector}]}],
+            }]}]})[0]
+            self.assertEqual(finding["security"]["cvss"], None, vector)
+            self.assertEqual(finding["severity"], "unknown", vector)
+            self.assertEqual(finding["security"]["cvssVector"], vector)
+
+        missing = normalize("osv-scanner", {"results": [{"source": {"path": "requirements.txt"}, "packages": [{
+            "package": {"name": "pkg", "version": "1"}, "vulnerabilities": [{"id": "OSV-MISSING"}],
+        }]}]})[0]
+        self.assertEqual(missing["security"]["cvss"], None)
+        self.assertEqual(missing["severity"], "unknown")
+
     def test_repeated_ds026_findings_group_without_dropping_locations(self):
         findings = normalize("trivy", {"Results": [
             {"Target": f"docker/service-{index}.Dockerfile", "Type": "dockerfile", "Misconfigurations": [
@@ -217,6 +253,185 @@ class RemediationTests(unittest.TestCase):
 
 
 class ScannerContinuationTests(unittest.TestCase):
+    def test_parser_failure_isolated_and_run_marked_incomplete(self):
+        class LaterCleanScanner:
+            name = "later-clean"
+            called = False
+
+            def execute(self, context):
+                self.called = True
+                result = ScannerResult(
+                    self.name, "test", "clean", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/later-clean.json", finding_count=0,
+                )
+                return result, []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            output = Path(temporary) / "out"
+            root.mkdir()
+            (root / "app.py").write_text("print('safe')", encoding="utf-8")
+            later = LaterCleanScanner()
+            config = {"policy": {"failOn": ["critical", "high"], "failOnSecrets": True, "maxHigh": None}, "timeouts": {}}
+            with patch("security_runner.scanners.Scanner._version", return_value="test"), patch(
+                "security_runner.scanners._run_process", return_value=("not-json", "", 0)
+            ):
+                code, report = run_scan(root, output, config, [SastScanner(), later])
+            self.assertTrue(later.called)
+            self.assertEqual(code, 2)
+            self.assertEqual(report["scanners"][0]["status"], "failed")
+            self.assertEqual(report["scanners"][1]["status"], "clean")
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
+    def test_scanner_schema_envelopes_and_versions_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text("print(1)", encoding="utf-8")
+            (root / "package-lock.json").write_text("{}", encoding="utf-8")
+            output = root / "out"
+            raw_dir = output / "raw"
+            raw_dir.mkdir(parents=True)
+            context = ScannerContext(root, output, raw_dir, detect_project(root), 5)
+            supported = {
+                "trivy": {
+                    "SchemaVersion": 2, "ArtifactName": "workspace", "ArtifactType": "filesystem",
+                    "CreatedAt": "2026-10-01T00:00:00Z", "Metadata": {}, "Results": [],
+                },
+                "osv-scanner": {"results": []},
+                "semgrep": {"version": "1.99.0", "results": [], "errors": []},
+            }
+            for scanner in (TrivyScanner(), OsvScanner(), SastScanner()):
+                with self.subTest(scanner=scanner.name), patch(
+                    "security_runner.scanners.Scanner._version", return_value="test"
+                ), patch(
+                    "security_runner.scanners._run_process",
+                    return_value=(json.dumps(supported[scanner.name]), "", 0),
+                ):
+                    result, findings = scanner.execute(context)
+                self.assertEqual(result.status, "clean")
+                self.assertEqual(findings, [])
+                self.assertEqual(result.schema_version, {"trivy": "2", "osv-scanner": None, "semgrep": "1.99.0"}[scanner.name])
+
+            with patch("security_runner.scanners.Scanner._version", return_value="test"), patch(
+                "security_runner.scanners._run_process",
+                return_value=(json.dumps({
+                    "SchemaVersion": 2, "ArtifactName": "workspace", "ArtifactType": "filesystem",
+                    "CreatedAt": "2026-10-01T00:00:00Z", "Metadata": {},
+                }), "", 0),
+            ):
+                result, findings = TrivyScanner().execute(context)
+            self.assertEqual(result.status, "clean")
+            self.assertEqual(findings, [])
+
+    def test_unsupported_scanner_envelopes_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text("print(1)", encoding="utf-8")
+            (root / "package-lock.json").write_text("{}", encoding="utf-8")
+            output = root / "out"
+            raw_dir = output / "raw"
+            raw_dir.mkdir(parents=True)
+            context = ScannerContext(root, output, raw_dir, detect_project(root), 5)
+            cases = (
+                (TrivyScanner(), {"SchemaVersion": 3, "Results": []}),
+                (OsvScanner(), {"results": [{}]}),
+                (SastScanner(), {"version": "1.99.0", "results": {}, "errors": []}),
+            )
+            for scanner, document in cases:
+                with self.subTest(scanner=scanner.name), patch(
+                    "security_runner.scanners.Scanner._version", return_value="test"
+                ), patch(
+                    "security_runner.scanners._run_process",
+                    return_value=(json.dumps(document), "", 0),
+                ):
+                    result, findings = scanner.execute(context)
+                self.assertEqual(result.status, "failed")
+                self.assertIn("schema is unsupported", result.error)
+                self.assertEqual(findings, [])
+
+    def test_schema_failure_isolated_and_network_failure_is_not_clean(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "app.py").write_text("print(1)", encoding="utf-8")
+            (root / "package-lock.json").write_text("{}", encoding="utf-8")
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+
+            def trivy_schema_failure(command, *_args):
+                if command[0] == "trivy":
+                    return json.dumps({"futureEnvelope": True}), "", 0
+                if command[0] == "osv-scanner":
+                    return json.dumps({"results": []}), "", 0
+                return json.dumps({"version": "1.99.0", "results": [], "errors": []}), "", 0
+
+            with patch("security_runner.scanners.Scanner._version", return_value="test"), patch(
+                "security_runner.scanners._run_process", side_effect=trivy_schema_failure
+            ):
+                code, report = run_scan(root, Path(temporary) / "out-schema", config)
+            self.assertEqual(code, 2)
+            self.assertEqual([item["status"] for item in report["scanners"]], ["failed", "clean", "clean"])
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
+            self.assertEqual(report["scanners"][2]["schemaVersion"], "1.99.0")
+
+            def trivy_network_failure(command, *_args):
+                if command[0] == "trivy":
+                    return json.dumps({"SchemaVersion": 2, "Results": []}), "network unavailable", 2
+                if command[0] == "osv-scanner":
+                    return json.dumps({"results": []}), "", 0
+                return json.dumps({"version": "1.99.0", "results": [], "errors": []}), "", 0
+
+            with patch("security_runner.scanners.Scanner._version", return_value="test"), patch(
+                "security_runner.scanners._run_process", side_effect=trivy_network_failure
+            ):
+                code, report = run_scan(root, Path(temporary) / "out-network", config)
+            self.assertEqual(code, 2)
+            self.assertEqual(report["scanners"][0]["status"], "failed")
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
+
+    def test_all_applicable_scanners_clean_allows_gate_pass(self):
+        class CleanScanner:
+            name = "test-clean"
+
+            def execute(self, context):
+                result = ScannerResult(
+                    self.name, "test", "clean", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/test-clean.json", finding_count=0,
+                )
+                return result, []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "app.py").write_text("print('hello')", encoding="utf-8")
+            config = {"policy": {"failOn": ["critical", "high"], "failOnSecrets": True, "maxHigh": None}, "timeouts": {}}
+            code, report = run_scan(root, Path(temporary) / "out", config, [CleanScanner()])
+            self.assertEqual(code, 0)
+            self.assertEqual(report["executionStatus"], "completed")
+            self.assertEqual(report["securityGate"]["status"], "passed")
+
+    def test_all_applicable_scanners_failed_is_incomplete(self):
+        class FailedScanner:
+            name = "test-failed"
+
+            def execute(self, context):
+                result = ScannerResult(
+                    self.name, "test", "failed", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/test-failed.json", "failure",
+                )
+                return result, []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "app.py").write_text("print('hello')", encoding="utf-8")
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            code, report = run_scan(root, Path(temporary) / "out", config, [FailedScanner()])
+            self.assertEqual(code, 2)
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
+
     def test_disabled_scanner_is_skipped_not_clean(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -258,7 +473,7 @@ class ScannerContinuationTests(unittest.TestCase):
             output = Path(temporary) / "output"
             root.mkdir()
             (root / "app.py").write_text("print('hello')", encoding="utf-8")
-            scanners = [StubScanner("trivy", "failed"), StubScanner("osv-scanner", "skipped"), StubScanner("semgrep", "completed")]
+            scanners = [StubScanner("trivy", "failed"), StubScanner("osv-scanner", "skipped"), StubScanner("semgrep", "clean")]
             config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
             scan_id = "a8f55dfc-a41a-4c28-9808-990706ef8a22"
             previous_scan_id = os.environ.get("SECURITY_SCAN_ID")
@@ -270,16 +485,45 @@ class ScannerContinuationTests(unittest.TestCase):
                     os.environ.pop("SECURITY_SCAN_ID", None)
                 else:
                     os.environ["SECURITY_SCAN_ID"] = previous_scan_id
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 2)
             self.assertTrue(all(scanner.called for scanner in scanners))
-            self.assertEqual([item["status"] for item in report["scanners"]], ["failed", "skipped", "completed"])
+            self.assertEqual([item["status"] for item in report["scanners"]], ["failed", "skipped", "clean"])
             self.assertEqual(report["scanId"], scan_id)
-            self.assertEqual(report["executionStatus"], "completed")
-            self.assertEqual(report["securityGate"]["status"], "passed")
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
             self.assertEqual(report["generator"]["name"], "Vesper")
             self.assertEqual(report["generator"]["version"], "0.2.0")
             self.assertEqual(json.loads((output / "summary.json").read_text(encoding="utf-8"))["generator"]["name"], "Vesper")
             self.assertTrue((output / "remediations.json").is_file())
+
+    def test_empty_workspace_with_no_applicable_scanners_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "empty"
+            root.mkdir()
+            output = Path(temporary) / "output"
+            config = {"policy": {"failOn": ["critical", "high"], "failOnSecrets": True, "maxHigh": None}, "timeouts": {}}
+            code, report = run_scan(root, output, config)
+            self.assertEqual(code, 2)
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
+            self.assertTrue(all(scanner["status"] == "not_applicable" for scanner in report["scanners"]))
+
+    def test_invalid_json_and_unexpected_json_types_fail_scanner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text("print(1)", encoding="utf-8")
+            output = root / "out"
+            raw = output / "raw"
+            raw.mkdir(parents=True)
+            context = ScannerContext(root, output, raw, detect_project(root), 5)
+            for stdout in ("not-json", "[]", '{"results":[{"extra":"unexpected-string"}]}'):
+                with self.subTest(stdout=stdout):
+                    with patch("security_runner.scanners.Scanner._version", return_value="test"), patch(
+                        "security_runner.scanners._run_process", return_value=(stdout, "", 0)
+                    ):
+                        result, findings = SastScanner().execute(context)
+                    self.assertEqual(result.status, "failed")
+                    self.assertEqual(findings, [])
 
 
 if __name__ == "__main__":

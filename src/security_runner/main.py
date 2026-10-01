@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from security_runner.runner import (
 
 
 def main() -> int:
+    if os.name != "nt":
+        os.umask(0o077)
     parser = argparse.ArgumentParser(description="Run local source security scanners")
     parser.add_argument("--workspace", default="/workspace", type=Path)
     parser.add_argument("--output", default="/output", type=Path)
