@@ -1,0 +1,4 @@
+policy:
+  failOn: []
+  failOnSecrets: false
+  maxHigh: null

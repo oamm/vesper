@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: synthetic-vulnerable-app
+spec:
+  containers:
+    - name: app
+      image: node:latest
+      securityContext:
+        privileged: true

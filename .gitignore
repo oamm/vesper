@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+artifacts/
+security-results/

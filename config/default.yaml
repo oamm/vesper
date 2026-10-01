@@ -1,0 +1,20 @@
+policy:
+  failOn:
+    - critical
+    - high
+  failOnSecrets: true
+  maxHigh: null
+
+timeouts:
+  default: 300
+  trivy: 600
+  osv: 300
+  sast: 600
+
+scanner:
+  trivy:
+    enabled: true
+  osv:
+    enabled: true
+  sast:
+    enabled: true
