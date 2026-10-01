@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace Vesper.Cli;
@@ -58,6 +59,13 @@ internal static class Program
             eventArgs.Cancel = true;
             cancellation.Cancel();
         };
+        using var sigtermRegistration = OperatingSystem.IsWindows()
+            ? null
+            : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+            {
+                context.Cancel = true;
+                cancellation.Cancel();
+            });
 
         try
         {
@@ -88,6 +96,11 @@ internal static class Program
             Console.Error.WriteLine($"[docker] {exception.Message}");
             return 2;
         }
+        catch (DockerOperationTimeoutException exception)
+        {
+            Console.Error.WriteLine($"[docker] {exception.Message}");
+            return 2;
+        }
         catch (Win32Exception exception)
         {
             Console.Error.WriteLine($"[docker] Unable to start Docker CLI: {exception.Message}");
@@ -108,11 +121,17 @@ internal static class Program
         var includeGit = false;
         var keepVolumes = false;
         var verbose = false;
-        var image = "vesper-runner:latest";
+        var image = LauncherImages.DefaultRunner;
         string? config = null;
         var cpus = ScanResourceLimits.Default.Cpus;
         var memory = ScanResourceLimits.Default.Memory;
         var pidsLimit = ScanResourceLimits.Default.PidsLimit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var maxWorkspaceBytes = WorkspaceTransferLimits.Default.MaxWorkspaceBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var maxFiles = WorkspaceTransferLimits.Default.MaxFiles.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var maxFileBytes = WorkspaceTransferLimits.Default.MaxFileBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var maxOutputBytes = WorkspaceTransferLimits.Default.MaxOutputBytes.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var maxOutputFiles = WorkspaceTransferLimits.Default.MaxOutputFiles.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var maxEntries = WorkspaceTransferLimits.Default.MaxEntries.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -143,6 +162,12 @@ internal static class Program
                 case "--cpus": cpus = Value(); break;
                 case "--memory": memory = Value(); break;
                 case "--pids-limit": pidsLimit = Value(); break;
+                case "--max-workspace-bytes": maxWorkspaceBytes = Value(); break;
+                case "--max-files": maxFiles = Value(); break;
+                case "--max-file-bytes": maxFileBytes = Value(); break;
+                case "--max-output-bytes": maxOutputBytes = Value(); break;
+                case "--max-output-files": maxOutputFiles = Value(); break;
+                case "--max-entries": maxEntries = Value(); break;
                 case "--include-git": includeGit = true; break;
                 case "--keep-volumes": keepVolumes = true; break;
                 case "--verbose": verbose = true; break;
@@ -169,7 +194,8 @@ internal static class Program
             verbose,
             image,
             config,
-            ScanResourceLimits.Parse(cpus, memory, pidsLimit));
+            ScanResourceLimits.Parse(cpus, memory, pidsLimit),
+            WorkspaceTransferLimits.Parse(maxWorkspaceBytes, maxFiles, maxFileBytes, maxOutputBytes, maxOutputFiles, maxEntries));
     }
 
     private static void PrintHelp()
@@ -187,10 +213,16 @@ internal static class Program
         Console.WriteLine("  --config PATH             Optional local scanner YAML configuration");
         Console.WriteLine("  --include-git             Include .git history in volume staging");
         Console.WriteLine("  --keep-volumes            Keep temporary Docker volumes and print their names");
-        Console.WriteLine("  --image IMAGE             Scanner image (default: vesper-runner:latest)");
+        Console.WriteLine($"  --image IMAGE             Scanner image (default: {LauncherImages.DefaultRunner})");
         Console.WriteLine("  --cpus NUMBER             CPU limit (default: 2)");
         Console.WriteLine("  --memory SIZE             Memory limit (default: 4g)");
         Console.WriteLine("  --pids-limit NUMBER       PID limit (default: 512)");
+        Console.WriteLine("  --max-workspace-bytes N   Source byte limit (default: 20 GiB)");
+        Console.WriteLine("  --max-files N             Source file count limit (default: 500000)");
+        Console.WriteLine("  --max-file-bytes N        Single source/output file limit (default: 2 GiB)");
+        Console.WriteLine("  --max-output-bytes N      Extracted report byte limit (default: 4 GiB)");
+        Console.WriteLine("  --max-output-files N      Extracted report count limit (default: 100000)");
+        Console.WriteLine("  --max-entries N           Source/output archive entry limit (default: 600000)");
         Console.WriteLine("  --verbose                 Print resolved paths and extra context");
         Console.WriteLine("Commands: scan, inspect, report, gate, version");
     }
@@ -199,7 +231,7 @@ internal static class Program
     {
         var version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "unknown";
         Console.WriteLine($"Vesper {version}");
-        Console.WriteLine("Default scanner image: vesper-runner:latest");
+        Console.WriteLine($"Default scanner image: {LauncherImages.DefaultRunner}");
     }
 
     private static async Task<int> InspectDockerAsync()
@@ -209,7 +241,7 @@ internal static class Program
             var environment = await DockerEnvironmentDetector.DetectAsync(new DockerClient(), CancellationToken.None);
             Console.WriteLine("Vesper Docker Environment");
             Console.WriteLine($"Context: {environment.Context}");
-            Console.WriteLine($"Endpoint: {environment.Endpoint}");
+            Console.WriteLine($"Endpoint: {DockerEndpointClassifier.SanitizeForDisplay(environment.Endpoint)}");
             Console.WriteLine($"Daemon: {(environment.IsRemote ? "remote" : "local")}");
             return 0;
         }
@@ -241,7 +273,7 @@ internal static class Program
             {
                 Console.WriteLine(reason.GetString());
             }
-            return gateStatus == "failed" ? 1 : 0;
+            return SecurityGateExitPolicy.FromStatus(gateStatus);
         }
 
         Console.WriteLine("Vesper Security Report");

@@ -9,7 +9,8 @@ public sealed record LaunchOptions(
     bool Verbose,
     string Image,
     string? ConfigPath,
-    ScanResourceLimits ResourceLimits);
+    ScanResourceLimits ResourceLimits,
+    WorkspaceTransferLimits TransferLimits);
 
 public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClient = null)
 {
@@ -44,13 +45,26 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
 
         var environment = await DockerEnvironmentDetector.DetectAsync(docker, cancellationToken);
         var mode = WorkspaceModeResolver.Resolve(options.WorkspaceMode, environment.IsRemote, environment.Endpoint, workspace);
-        var execution = ScanExecutionContext.Create(workspace, outputRoot, mode == WorkspaceMode.Volume, configPath is not null);
-        Directory.CreateDirectory(execution.OutputPath);
-        var stats = WorkspaceArchive.Measure(workspace, execution.OutputRootPath, configPath, options.IncludeGit);
+        var execution = ScanExecutionContext.Create(
+            workspace, outputRoot, mode == WorkspaceMode.Volume, configPath is not null,
+            dockerContext: environment.Context);
+        if (Directory.Exists(execution.OutputPath) || File.Exists(execution.OutputPath))
+        {
+            throw new IOException("The scan-specific output path already exists.");
+        }
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(execution.OutputPath);
+        }
+        else
+        {
+            Directory.CreateDirectory(execution.OutputPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        var stats = WorkspaceArchive.Measure(workspace, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits);
 
         Console.WriteLine("Vesper Security Scan");
         Console.WriteLine($"Docker context: {environment.Context}");
-        Console.WriteLine($"Docker endpoint: {environment.Endpoint}");
+        Console.WriteLine($"Docker endpoint: {DockerEndpointClassifier.SanitizeForDisplay(environment.Endpoint)}");
         Console.WriteLine($"Workspace mode: {mode.ToString().ToLowerInvariant()}");
         Console.WriteLine("Preparing source...");
         Console.WriteLine($"  {stats.FileCount} files");
@@ -58,6 +72,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         if (options.Verbose)
         {
             Console.WriteLine($"Scan ID: {execution.ScanIdText}");
+            Console.WriteLine($"Docker context: {execution.DockerContext}");
             Console.WriteLine($"Project: {execution.ProjectName}");
             Console.WriteLine($"Container: {execution.ContainerName}");
             if (execution.SourceVolumeName is not null)
@@ -119,7 +134,8 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
 
         try
         {
-            var workspaceArchive = WorkspaceArchive.Create(execution.SourcePath, execution.OutputRootPath, configPath, options.IncludeGit);
+            var workspaceArchive = WorkspaceArchive.Create(
+                execution.SourcePath, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits);
             archivePaths.Add(workspaceArchive.ArchivePath);
             await CreateVolumeAsync(sourceVolume, execution, "source", cancellationToken);
             await CreateVolumeAsync(outputVolume, execution, "output", cancellationToken);
@@ -133,7 +149,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             if (configPath is not null && configVolume is not null)
             {
                 await CreateVolumeAsync(configVolume, execution, "config", cancellationToken);
-                var configArchive = WorkspaceArchive.CreateSingleFile(configPath, "security.yaml");
+                var configArchive = WorkspaceArchive.CreateSingleFile(configPath, "security.yaml", options.TransferLimits);
                 archivePaths.Add(configArchive);
                 var configUploadName = execution.HelperContainerName("config-upload");
                 helperContainers.Add(configUploadName);
@@ -185,8 +201,10 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
                     archivePaths.Add(exportArchive);
                     var exportName = execution.HelperContainerName("download");
                     helperContainers.Add(exportName);
-                    await docker.DownloadArchiveAsync(LauncherImages.ArchiveHelper, outputVolume, "/output", exportArchive, exportName, execution, "download", CancellationToken.None);
-                    WorkspaceArchive.Extract(exportArchive, execution.OutputPath);
+                    await docker.DownloadArchiveAsync(
+                        LauncherImages.ArchiveHelper, outputVolume, "/output", exportArchive, exportName,
+                        execution, "download", options.TransferLimits.MaxOutputArchiveBytes, CancellationToken.None);
+                    ExtractAndPublish(exportArchive, execution, options.TransferLimits);
                     exportSucceeded = true;
                     Console.WriteLine($"  {DisplayPath(execution.OutputPath)}");
                 }
@@ -222,6 +240,50 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         return ScannerExitPolicy.AfterExport(scannerExitCode.Value, exportSucceeded);
     }
 
+    private static void ExtractAndPublish(string archivePath, ScanExecutionContext execution, WorkspaceTransferLimits limits)
+    {
+        var stagingPath = Path.Combine(
+            execution.OutputRootPath,
+            $".{Path.GetFileName(execution.OutputPath)}.staging-{Guid.NewGuid():N}");
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                Directory.CreateDirectory(stagingPath);
+            }
+            else
+            {
+                Directory.CreateDirectory(
+                    stagingPath,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            WorkspaceArchive.Extract(archivePath, stagingPath, limits);
+            if (Directory.Exists(execution.OutputPath))
+            {
+                if ((File.GetAttributes(execution.OutputPath) & FileAttributes.ReparsePoint) != 0
+                    || Directory.EnumerateFileSystemEntries(execution.OutputPath).Any())
+                {
+                    throw new IOException("The scan output destination changed before reports could be published.");
+                }
+                Directory.Delete(execution.OutputPath);
+            }
+            else if (File.Exists(execution.OutputPath))
+            {
+                throw new IOException("The scan output destination changed before reports could be published.");
+            }
+
+            Directory.Move(stagingPath, execution.OutputPath);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+        }
+    }
+
     private async Task CreateVolumeAsync(string name, ScanExecutionContext execution, string resource, CancellationToken cancellationToken)
     {
         var arguments = new List<string> { "volume", "create" };
@@ -255,6 +317,10 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             {
                 ownedVolumes.Add(volume);
             }
+            else
+            {
+                Console.Error.WriteLine($"[cleanup] Could not verify ownership of volume '{volume}' for scan {execution.ScanIdText}; it was not removed.");
+            }
         }
 
         if (options.KeepVolumes)
@@ -274,12 +340,12 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
                 var result = await docker.CaptureAsync(["volume", "rm", "--force", volume], CancellationToken.None);
                 if (result.ExitCode != 0)
                 {
-                    Console.Error.WriteLine($"[launcher] Could not remove temporary volume '{volume}'. Check it manually.");
+                    Console.Error.WriteLine($"[cleanup] Could not remove owned volume '{volume}'. Check it manually.");
                 }
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"[launcher] Could not remove temporary volume '{volume}': {exception.Message}");
+                Console.Error.WriteLine($"[cleanup] Could not remove owned volume '{volume}' ({exception.GetType().Name}). Check it manually.");
             }
         }
     }
@@ -291,10 +357,19 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             var result = await docker.CaptureAsync(
                 ["volume", "inspect", name, "--format", "{{ index .Labels \"securityscan.managed\" }}|{{ index .Labels \"securityscan.scan-id\" }}"],
                 CancellationToken.None);
-            return result.ExitCode == 0 && execution.OwnsResourceLabels(result.StandardOutput);
+            if (result.ExitCode != 0)
+            {
+                if (!result.StandardError.Contains("no such volume", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.Error.WriteLine($"[cleanup] Could not inspect volume '{name}'; ownership was not verified.");
+                }
+                return false;
+            }
+            return execution.OwnsResourceLabels(result.StandardOutput);
         }
-        catch
+        catch (Exception exception)
         {
+            Console.Error.WriteLine($"[cleanup] Could not inspect volume '{name}' ({exception.GetType().Name}); ownership was not verified.");
             return false;
         }
     }
@@ -306,14 +381,28 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             var inspection = await docker.CaptureAsync(
                 ["container", "inspect", name, "--format", "{{ index .Config.Labels \"securityscan.managed\" }}|{{ index .Config.Labels \"securityscan.scan-id\" }}"],
                 CancellationToken.None);
-            if (inspection.ExitCode != 0 || !execution.OwnsResourceLabels(inspection.StandardOutput))
+            if (inspection.ExitCode != 0)
+            {
+                if (!inspection.StandardError.Contains("no such object", StringComparison.OrdinalIgnoreCase)
+                    && !inspection.StandardError.Contains("no such container", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.Error.WriteLine($"[cleanup] Could not inspect container '{name}'; ownership was not verified.");
+                }
+                return;
+            }
+            if (!execution.OwnsResourceLabels(inspection.StandardOutput))
             {
                 return;
             }
-            await docker.CaptureAsync(["rm", "--force", name], CancellationToken.None);
+            var removal = await docker.CaptureAsync(["rm", "--force", name], CancellationToken.None);
+            if (removal.ExitCode != 0 && !removal.StandardError.Contains("no such container", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.Error.WriteLine($"[cleanup] Could not remove owned container '{name}'. Check it manually.");
+            }
         }
-        catch
+        catch (Exception exception)
         {
+            Console.Error.WriteLine($"[cleanup] Could not inspect/remove container '{name}' ({exception.GetType().Name}).");
         }
     }
 
@@ -372,8 +461,9 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         {
             File.Delete(path);
         }
-        catch
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
+            Console.Error.WriteLine($"[launcher] Could not remove a temporary archive ({exception.GetType().Name}); it may need manual cleanup.");
         }
     }
 }

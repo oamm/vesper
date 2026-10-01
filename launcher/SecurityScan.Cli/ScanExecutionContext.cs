@@ -2,6 +2,7 @@ namespace Vesper.Cli;
 
 public sealed record ScanExecutionContext(
     Guid ScanId,
+    string DockerContext,
     string SourcePath,
     string OutputRootPath,
     string OutputPath,
@@ -20,7 +21,8 @@ public sealed record ScanExecutionContext(
         string outputRootPath,
         bool useVolumes,
         bool hasConfig,
-        Guid? scanId = null)
+        Guid? scanId = null,
+        string dockerContext = "default")
     {
         var id = scanId ?? Guid.NewGuid();
         var shortId = id.ToString("N")[..12];
@@ -34,6 +36,7 @@ public sealed record ScanExecutionContext(
             : null;
         return new ScanExecutionContext(
             id,
+            dockerContext,
             sourceFullPath,
             outputFullPath,
             Path.Combine(outputFullPath, id.ToString("N")),
@@ -47,7 +50,7 @@ public sealed record ScanExecutionContext(
 
     public string HelperContainerName(string resource)
     {
-        return $"vesper-{resource}-{ShortId}-{Guid.NewGuid():N}";
+        return $"vesper-{resource}-{ShortId}";
     }
 
     public IReadOnlyList<string> Labels(string resource)

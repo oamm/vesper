@@ -16,6 +16,28 @@ public sealed class WorkspaceModeException(string message) : InvalidOperationExc
 
 public static class DockerEndpointClassifier
 {
+    public static string SanitizeForDisplay(string endpoint)
+    {
+        if (endpoint.StartsWith("unix://", StringComparison.OrdinalIgnoreCase)
+            || endpoint.StartsWith("npipe://", StringComparison.OrdinalIgnoreCase))
+        {
+            return endpoint;
+        }
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+        {
+            return "<unrecognized endpoint>";
+        }
+
+        var safeUri = new UriBuilder(uri)
+        {
+            UserName = "",
+            Password = "",
+            Query = "",
+            Fragment = "",
+        };
+        return safeUri.Uri.ToString();
+    }
+
     public static bool IsRemote(string? endpoint)
     {
         if (string.IsNullOrWhiteSpace(endpoint))
@@ -67,7 +89,7 @@ public static class WorkspaceModeResolver
         if (requested == WorkspaceMode.Bind && daemonIsRemote)
         {
             throw new WorkspaceModeException(
-                $"Bind mode cannot access local path:\n\n{workspace ?? "<workspace>"}\n\nbecause the active Docker daemon is remote:\n\n{endpoint ?? "<remote endpoint>"}\n\nUse --workspace-mode volume or switch to a local Docker context.");
+                $"Bind mode cannot access local path:\n\n{workspace ?? "<workspace>"}\n\nbecause the active Docker daemon is remote:\n\n{(endpoint is null ? "<remote endpoint>" : DockerEndpointClassifier.SanitizeForDisplay(endpoint))}\n\nUse --workspace-mode volume or switch to a local Docker context.");
         }
 
         return requested == WorkspaceMode.Auto
@@ -126,6 +148,23 @@ public static class DockerEnvironmentDetector
         }
 
         endpoint ??= "unknown";
+        docker.PinTarget(
+            context,
+            Environment.GetEnvironmentVariable("DOCKER_CONTEXT"),
+            Environment.GetEnvironmentVariable("DOCKER_HOST"));
         return new DockerEnvironmentInfo(context, endpoint, DockerEndpointClassifier.IsRemote(endpoint));
+    }
+}
+
+public static class SecurityGateExitPolicy
+{
+    public static int FromStatus(string status)
+    {
+        return status switch
+        {
+            "passed" => 0,
+            "failed" => 1,
+            _ => 2,
+        };
     }
 }
