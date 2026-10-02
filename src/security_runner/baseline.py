@@ -19,7 +19,7 @@ CAPABILITY_BY_CATEGORY = {
 }
 SEVERITY_WEIGHT = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 SCANNERS_BY_CAPABILITY = {
-    "dependency": {"osv-scanner", "trivy"},
+    "dependency": {"osv-scanner", "trivy", "grype"},
     "sast": {"semgrep"},
     "secret": {"trivy"},
     "container": {"trivy"},

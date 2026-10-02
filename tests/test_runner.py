@@ -8,11 +8,12 @@ from unittest.mock import patch
 
 from security_runner.detection import detect_project
 from security_runner.models import ScannerContext, ScannerResult
-from security_runner.normalization import deduplicate, normalize, normalize_severity
+from security_runner.normalization import deduplicate, normalize, normalize_grype, normalize_severity
 from security_runner.policy import evaluate
 from security_runner.remediations import build_remediations
 from security_runner.runner import ReportConsistencyError, _validate_report_consistency, run_scan
-from security_runner.scanners import OsvScanner, SastScanner, TrivyScanner
+from security_runner.components import normalize_components
+from security_runner.scanners import GrypeScanner, OsvScanner, SastScanner, SyftScanner, TrivyScanner
 
 
 class DetectionTests(unittest.TestCase):
@@ -32,6 +33,148 @@ class DetectionTests(unittest.TestCase):
             self.assertIn("pnpm-lock.yaml", project.lockfiles)
             self.assertNotIn("security-results/package-lock.json", project.artifacts)
             self.assertNotIn("obj/ignored.cs", project.artifacts)
+
+
+class ComponentInventoryTests(unittest.TestCase):
+    def _cyclonedx(self, components):
+        return {"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1, "components": components}
+
+    def test_normalizes_purl_identity_and_merges_occurrences_deterministically(self):
+        raw = self._cyclonedx([
+            {"type": "library", "name": "System.Text.Json", "version": "8.0.4", "purl": "pkg:nuget/System.Text.Json@8.0.4", "evidence": {"occurrences": [{"location": {"path": "/workspace/ProjectB/packages.lock.json"}}]}},
+            {"type": "library", "name": "System.Text.Json", "version": "8.0.4", "purl": "pkg:nuget/System.Text.Json@8.0.4", "locations": [{"path": "ProjectA/packages.lock.json"}]},
+        ])
+        inventory = normalize_components(raw, "raw/syft.cdx.json")
+        self.assertEqual(len(inventory["components"]), 1)
+        component = inventory["components"][0]
+        self.assertEqual(component["ecosystem"], "nuget")
+        self.assertEqual(component["purl"], "pkg:nuget/System.Text.Json@8.0.4")
+        self.assertEqual([item["path"] for item in component["occurrences"]], ["ProjectA/packages.lock.json", "ProjectB/packages.lock.json"])
+        reordered = normalize_components(self._cyclonedx(list(reversed(raw["components"]))), "raw/syft.cdx.json")
+        self.assertEqual(inventory["components"], reordered["components"])
+
+    def test_fallback_identity_does_not_require_purl(self):
+        raw = self._cyclonedx([{"type": "library", "name": "left-pad", "version": "1.3.0", "properties": [{"name": "syft:package:type", "value": "npm"}]}])
+        component = normalize_components(raw, "raw/syft.cdx.json")["components"][0]
+        self.assertEqual(component["ecosystem"], "npm")
+        self.assertNotIn("purl", component)
+        self.assertTrue(component["id"].startswith("component-"))
+
+    def test_syft_schema_rejects_unsupported_envelope(self):
+        with self.assertRaises(ValueError):
+            SyftScanner().validate_schema({"bomFormat": "SPDX", "components": []})
+
+    def test_syft_execution_retains_raw_output_and_normalized_inventory(self):
+        raw = self._cyclonedx([{"type": "library", "name": "requests", "version": "2.32.0", "purl": "pkg:pypi/requests@2.32.0"}])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text("print('ok')", encoding="utf-8")
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch("security_runner.scanners.Scanner._version", return_value="syft 1.52.0"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps(raw), "", 0)
+            ):
+                result, findings = SyftScanner().execute(context)
+            self.assertEqual(result.status, "clean")
+            self.assertEqual(findings, [])
+            self.assertEqual(result.coverage["assessment"], "complete")
+            self.assertEqual(len(result.coverage["targets"]), 1)
+            self.assertEqual(len(SyftScanner().additional_artifacts(raw, context)["components"]["components"]), 1)
+            self.assertTrue((output / "raw" / "syft.cdx.json").is_file())
+
+    def test_syft_invalid_output_and_process_failure_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text("print('ok')", encoding="utf-8")
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch("security_runner.scanners.Scanner._version", return_value="syft 1.52.0"), patch(
+                "security_runner.scanners._run_process", return_value=("not-json", "", 0)
+            ):
+                invalid, _ = SyftScanner().execute(context)
+            self.assertEqual(invalid.status, "failed")
+            with patch("security_runner.scanners.Scanner._version", return_value="syft 1.52.0"), patch(
+                "security_runner.scanners._run_process", return_value=("{}", "process failure", 2)
+            ):
+                failed, _ = SyftScanner().execute(context)
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(SyftScanner().extra_artifacts, {})
+
+    def test_grype_normalization_links_component_and_preserves_fixed_versions(self):
+        inventory = {
+            "schemaVersion": 1,
+            "components": [{
+                "id": "component-json",
+                "ecosystem": "nuget",
+                "name": "Newtonsoft.Json",
+                "version": "13.0.1",
+                "purl": "pkg:nuget/Newtonsoft.Json@13.0.1",
+                "occurrences": [{"path": "ProjectA/packages.lock.json"}, {"path": "ProjectB/packages.lock.json"}],
+            }],
+        }
+        raw = {
+            "descriptor": {"name": "grype", "version": "0.119.0", "db": {"status": "verified", "schemaVersion": 6}},
+            "matches": [{
+                "vulnerability": {"id": "CVE-2024-1234", "severity": "High", "description": "test", "fix": {"versions": ["13.0.2"]}},
+                "artifact": {"name": "Newtonsoft.Json", "version": "13.0.1", "type": "dotnet", "purl": "pkg:nuget/Newtonsoft.Json@13.0.1"},
+            }],
+        }
+        finding = normalize_grype(raw, inventory)[0]
+        self.assertEqual(finding["fingerprintVersion"], 2)
+        self.assertEqual(finding["package"]["componentId"], "component-json")
+        self.assertEqual(finding["location"]["file"], "ProjectA/packages.lock.json")
+        self.assertEqual(finding["package"]["fixedVersion"], "13.0.2")
+        self.assertEqual(finding["scannerEvidence"][0]["nativeFixedVersion"], "13.0.2")
+
+    def test_grype_and_trivy_same_semantic_vulnerability_deduplicate(self):
+        inventory = {"schemaVersion": 1, "components": [{"id": "component-json", "ecosystem": "nuget", "name": "Newtonsoft.Json", "version": "13.0.1", "purl": "pkg:nuget/Newtonsoft.Json@13.0.1", "occurrences": [{"path": "ProjectA/packages.lock.json"}]}]}
+        grype = normalize_grype({"descriptor": {"name": "grype", "version": "0.119.0"}, "matches": [{"vulnerability": {"id": "CVE-2024-1234", "severity": "High", "fix": {"versions": ["13.0.2"]}}, "artifact": {"name": "Newtonsoft.Json", "version": "13.0.1", "purl": "pkg:nuget/Newtonsoft.Json@13.0.1"}}]}, inventory)
+        trivy = normalize("trivy", {"ArtifactName": "ProjectA", "ArtifactType": "filesystem", "Results": [{"Target": "ProjectA/packages.lock.json", "Vulnerabilities": [{"VulnerabilityID": "CVE-2024-1234", "PkgName": "Newtonsoft.Json", "InstalledVersion": "13.0.1", "FixedVersion": "13.0.2", "PkgIdentifier": {"PURL": "pkg:nuget/Newtonsoft.Json@13.0.1"}, "Severity": "HIGH"}]}]})
+        merged = deduplicate(grype + trivy)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["detectors"], ["grype", "trivy"])
+
+    def test_grype_scan_uses_syft_inventory_and_preserves_report_invariants(self):
+        syft_raw = self._cyclonedx([{"type": "library", "name": "Example.Package", "version": "1.0.0", "purl": "pkg:nuget/Example.Package@1.0.0", "locations": [{"path": "packages.lock.json"}]}])
+        grype_raw = {"descriptor": {"name": "grype", "version": "0.119.0", "db": {"status": "verified", "schemaVersion": 6}}, "matches": [{"vulnerability": {"id": "CVE-2024-12345", "severity": "HIGH", "fix": {"versions": ["1.0.1"]}}, "artifact": {"name": "Example.Package", "version": "1.0.0", "purl": "pkg:nuget/Example.Package@1.0.0"}}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "packages.lock.json").write_text("{}", encoding="utf-8")
+            output = root / "output"
+            with patch("security_runner.scanners.Scanner._version", return_value="syft 1.52.0"), patch(
+                "security_runner.scanners.GrypeScanner._version", return_value="0.119.0"
+            ), patch("security_runner.scanners._run_process", side_effect=[(json.dumps(syft_raw), "", 0), (json.dumps(grype_raw), "", 0)]):
+                code, report = run_scan(workspace, output, {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "baseline": {"failOnNew": ["high"]}, "timeouts": {}}, [SyftScanner(), GrypeScanner()])
+            self.assertEqual(code, 0)
+            self.assertEqual(report["executionStatus"], "completed")
+            findings = json.loads((output / "findings.json").read_text(encoding="utf-8"))
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["package"]["componentId"], json.loads((output / "components.json").read_text(encoding="utf-8"))["components"][0]["id"])
+            self.assertEqual(summary["artifactVulnerabilities"], {"findings": 1, "componentsAffected": 1})
+
+    def test_grype_coverage_preserves_database_status_and_unknown_inventory(self):
+        scanner = GrypeScanner()
+        scanner.set_input_coverage({"schemaVersion": 1}, {"assessment": "complete", "inventoryAssessment": "unknown"})
+        raw = {
+            "matches": [],
+            "descriptor": {"name": "grype", "version": "0.119.0", "db": {"status": {
+                "schemaVersion": "v6.1.9",
+                "built": "2026-10-02T06:31:53Z",
+                "from": "https://grype.anchore.io/db?checksum=sha256%3Aabc",
+                "path": "/tmp/cache/grype/db/6/vulnerability.db",
+                "valid": True,
+            }}},
+        }
+        coverage = scanner.coverage_from_output(raw, None)
+        self.assertEqual(coverage["assessment"], "unknown")
+        self.assertEqual(coverage["inputAssessment"], "unknown")
+        self.assertEqual(coverage["database"]["schemaVersion"], "v6.1.9")
+        self.assertTrue(coverage["database"]["valid"])
 
     def test_detects_dotnet_node_docker_terraform_fixture_types(self):
         with tempfile.TemporaryDirectory() as temporary:

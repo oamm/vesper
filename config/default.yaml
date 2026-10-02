@@ -15,6 +15,8 @@ timeouts:
   trivy: 600
   osv: 300
   sast: 600
+  syft: 600
+  grype: 600
 
 scanner:
   trivy:
@@ -22,4 +24,8 @@ scanner:
   osv:
     enabled: true
   sast:
+    enabled: true
+  syft:
+    enabled: true
+  grype:
     enabled: true

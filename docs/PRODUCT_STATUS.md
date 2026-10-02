@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-10-02
 **Current version:** 0.2.0
-**Current milestone:** M2 - Baseline and Finding Diff (COMPLETE)
+**Current milestone:** M3 - Artifact and Supply Chain Security (IN PROGRESS)
 **Overall status:** IN PROGRESS
 
 ## Product Goal
@@ -17,7 +17,7 @@ Developer / CI
        -> Docker CLI and selected context
           -> one ephemeral vesper-runner container per scan
              -> Python orchestration and project detection
-             -> Trivy / OSV-Scanner / Semgrep
+             -> Trivy / OSV-Scanner / Semgrep / Syft / Grype
              -> normalization / deduplication / remediation groups / policy / reports
 ```
 
@@ -30,12 +30,12 @@ Developer / CI
 
 ## Current Capabilities
 
-- Scanner image: Trivy 0.58.2, OSV-Scanner 2.3.3, Semgrep 1.99.0; image default is `vesper-runner:0.2.0`.
+- Scanner image: Trivy 0.58.2, OSV-Scanner 2.3.3, Semgrep 1.99.0, Syft 1.52.0, Grype 0.119.0; image default is `vesper-runner:0.2.0`.
 - Host CLI: .NET 10 Native AOT; Windows `win-x64` and Linux `linux-x64` have been published and runtime-tested.
 - Docker endpoint classification supports npipe, Unix socket, SSH, loopback and remote TCP/HTTP(S); Docker calls are pinned to the context/host selected at scan start.
 - Local bind and remote volume workspace modes; source archives exclude common generated directories and enforce byte/file/per-file ceilings.
 - Scan-specific report directories, labeled Docker resources, bounded Docker operation timeouts, runner limits, fail-closed execution completeness, and per-scan cleanup.
-- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts. A completed scan can create a versioned `baseline.json`; scans with a baseline emit a separate `comparison.json` without mutating current findings.
+- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts. M3.1 additionally emits a versioned `components.json` inventory and compact component summary. A completed scan can create a versioned `baseline.json`; scans with a baseline emit a separate `comparison.json` without mutating current findings.
 - Scanner execution status is separate from coverage assessment and policy gate; `unsupported_manifest` is explicit and cannot be treated as clean. Reports use schema v2 and validate internal totals/references before writing final JSON.
 
 ## Milestones
@@ -230,6 +230,8 @@ Developer / CI
 - That scan's 8 report files total 236,459 bytes; `summary.json` is 4,539 bytes. Reconstructing the removed aliases and category/severity matrix from the same data adds 552 bytes (16%) to compact-serialized summary JSON. No pre-change report bundle is retained in `security-results`, so an exact historical bundle-size comparison is unavailable.
 - The Windows Native AOT publish could not be refreshed on this host because the Visual C++ desktop workload/linker is unavailable. The checked-in local executable is older than current CLI source; source fallback for `report`/`gate` and source-built .NET tests pass. The published AOT artifact remains UNVERIFIED; this does not block the Python baseline runner or M2 acceptance.
 - The live minimist finding at 0.0.8 selects 0.2.4 as the highest common patch threshold on its 0.x minor line while preserving other candidates. Regression cases verify `System.Text.Json` 8.0.4 chooses 8.0.5 over 6.0.10, downgrade refusal, and no common target across disjoint branches.
+- Fresh current-schema Lynx acceptance completed through the trusted remote Docker endpoint using the PowerShell source fallback. Scan A `858314fb-92c1-4a02-979c-cb046853b19e` and Scan B `c028d89a-6ccf-4ef5-bcc9-afa9a4ac271c` each completed with 31 findings / 5 remediations. Baseline `baseline-44e97e0952684215e79ce4740d58c71d7d73ac07b8126686d6b5428964801eeb` validated with schema v1, identity version 1, fingerprint version 2, source metadata, coverage, and content digest. Comparison recorded `NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`; the absolute gate failed on the existing three HIGH findings, while the baseline delta passed. Saved `vesper report` exited 0, saved `vesper gate` reproduced exit 1, and a corrupted comparison returned exit 2. OSV coverage was complete; Semgrep remained partial with 24 parse errors; Trivy coverage remained unknown. No dynamic-data difference appeared between the two scans.
+- Final acceptance verification ran 62 Python tests and the .NET launcher acceptance suite; the launcher used source fallback because the Windows Visual C++ linker remains unavailable for a fresh Native AOT publish. The verified remote ECDSA host fingerprint was `SHA256:O4IV7/BSipd4ZxR0X0yoLIkgvhRlC2eUaRXM0/YoMcw`, matching the independently inspected host key; no Vesper endpoint defect was found.
 
 #### Acceptance criteria
 
@@ -247,55 +249,197 @@ Developer / CI
 
 ---
 
-### M3 - CI Distribution and Integration
+### M3 - Artifact and Supply Chain Security
+
+**Status:** IN PROGRESS
+
+**Goal:** Extend Vesper beyond source-tree findings into software artifacts, dependency inventory, SBOMs, Git history, and deterministic supply-chain evidence.
+
+**Candidate engines:** Syft, Grype, Gitleaks, and OpenSSF Scorecard.
+
+**Potential scope:** SBOM generation; CycloneDX / SPDX; container/image component inventory; SBOM vulnerability analysis; Git-history secret scanning; open-source supply-chain posture; and license/component metadata.
+
+Do not add tools simply to increase scanner count. Each engine must add a distinct security capability or meaningfully improve evidence quality.
+
+#### M3.1 - SBOM Foundation
+
+**Status:** COMPLETE
+
+Syft 1.52.0 is pinned to its official release archive and verified against the release checksum during the runner image build. Vesper invokes it as an isolated scanner and retains the native CycloneDX JSON artifact at `raw/syft.cdx.json`.
+
+The normalized `components.json` schema v1 separates semantic components from occurrence locations. Component identity uses a normalized PURL when available and otherwise `ecosystem + name + version`; Syft-native references and discovery properties remain provenance evidence. Occurrence paths are repository-relative, deduplicated, and deterministically ordered. File entries without package versions use the explicit `unknown` version rather than being silently discarded.
+
+Syft execution status, attempted target, coverage assessment, and component count are recorded independently in `scan.json`. A zero-component inventory is `limited`, not proof of complete coverage. Summary output contains only deterministic component totals, occurrence totals, and ecosystem counts; component presence does not affect the security gate.
+
+Focused normalization, PURL/fallback identity, duplicate occurrence, schema rejection, malformed-output, process-failure, raw-retention, and deterministic-order tests pass. The real Lynx regression completed with 596 normalized components, 17,431 occurrences, 445 NuGet components, 151 unknown/file components, 12.44 seconds Syft duration, a 23,437,505-byte raw SBOM, and a 6,168,089-byte normalized artifact. The report marked the attempted workspace target complete; that does not establish package-manager completeness beyond the target and evidence Syft provided. An observational comparison found the four vulnerable packages reported by OSV/Trivy were absent from this Syft inventory because those findings target `Invoice/packages.config`, while Syft cataloged the repository's lockfile/package sources; this is not correlation logic. M3.2 consumes this inventory but does not fill its gaps with independent vulnerability evidence.
+
+M3 decomposition remains:
+
+```text
+M3.1 SBOM Foundation                    COMPLETE
+     Syft
+M3.2 Artifact Vulnerability Analysis    IN PROGRESS
+     Grype
+M3.3 Repository Secret History          PLANNED
+     Gitleaks
+M3.4 Supply Chain Posture                PLANNED
+     OpenSSF Scorecard
+M3.5 M3 Integration and Acceptance      PLANNED
+```
+
+#### M3.2 - Artifact Vulnerability Analysis
+
+**Status:** IN PROGRESS
+
+Grype 0.119.0 is pinned to the official Linux amd64 release archive and verified against the published checksum during the runner image build. The release is Apache-2.0 licensed. Grype consumes the retained `raw/syft.cdx.json` CycloneDX artifact rather than independently rescanning the workspace. Native output is retained at `raw/grype.json` and normalized into the existing dependency finding model.
+
+Grype findings use the existing `fingerprintVersion: 2` semantic identity: dependency capability, project-relative target, ecosystem, package, and canonical vulnerability identifier. Component IDs, PURLs, occurrence locations, native match metadata, native severity, and fixed-version candidates remain evidence; they do not become a second identity system. Grype is included in dependency coverage and detector corroboration, so agreement with OSV or Trivy deduplicates to one finding without changing severity or gate policy.
+
+Grype coverage is explicitly derived from the Syft input assessment. `scan.json` records the SBOM input, input coverage, analysis status, match count, and database metadata when Grype emits it. Component presence does not affect the gate, and a missing Grype result cannot prove resolution.
+
+Synthetic tests cover valid and malformed Grype envelopes, process failure, component linkage, PURL identity, fixed-version propagation, Grype/Trivy deduplication, scanner-neutral fingerprints, database metadata retention, and report invariants. The first real Lynx attempt failed with exit `-9`; host kernel logs classified this as `CONSTRAINT_MEMCG` OOM in the runner container, with Grype as the killed process. This was a container memory-limit failure, not disk exhaustion: the Docker host reported a 32 GB filesystem with 19 GB available and 4% inode use, while the runner was limited to 4 GiB. A focused Grype run succeeded under the same 4 GiB isolation constraints, establishing that the full pipeline's aggregate memory pressure triggered the failure. The unchanged full scan reproduced the OOM at 4 GiB and completed at an explicitly raised 6 GiB per-scan limit; the default 4 GiB limit remains insufficient for this Lynx workload.
+
+The final database-backed Lynx scan used source fallback through the trusted remote SSH Docker endpoint with `--cpus 2 --memory 6g --pids-limit 512`. Scan `3575fa9a-e723-4c09-a7b2-8fa81cf2e7be` completed with 31 findings, 5 remediations, and the existing absolute gate failed on three HIGH findings. Syft produced 596 normalized components and 17,431 occurrences in 12.2 seconds; the raw CycloneDX artifact was 23,437,505 bytes and `components.json` was 6,168,089 bytes. Grype initialized database schema `v6.1.9`, built `2026-10-02T06:31:53Z`, with a valid database URL/checksum identity, and retained a 9,000-byte `raw/grype.json` artifact. It completed in 90.3 seconds with zero matches and therefore contributed no normalized findings or detector corroboration on Lynx.
+
+The four OSV/Trivy-vulnerable packages associated with `Invoice/packages.config` remain absent from the Syft SBOM and consequently absent from Grype's input. This is consistent with Syft cataloging the repository's lockfile/package sources rather than that legacy packages.config input. Grype cannot claim coverage for those packages; its report records `analysisStatus: completed` but `inputAssessment: unknown` and overall coverage `unknown`. The finding set remains the independent OSV/Trivy evidence, not a claim of SBOM completeness. Grype/OSV/Trivy deduplication and detector-set baseline stability pass synthetically; no real Lynx Grype corroboration was available because Grype reported zero matches.
+
+### M4 - API Security and Fuzzing
 
 **Status:** PLANNED
 
-**Goal:** Make versioned Vesper image/CLI usage repeatable in CI providers and publish verified platform artifacts.
+**Goal:** Use API contracts to deterministically exercise application behavior.
 
-#### Acceptance criteria
+**Candidate engine:** Schemathesis.
 
-- [ ] CI builds/tests/publishes pinned artifacts.
-- [ ] At least one hosted CI workflow validates exit codes and report artifacts.
-- [ ] Supported RIDs are published and runtime-smoke-tested on matching hosts.
+**Potential scope:** OpenAPI discovery; REST API test generation; negative testing; boundary-value testing; schema validation; unexpected response detection; and unexpected 5xx detection.
 
----
+Active testing must be explicit. It is not implemented in this task.
 
-### M4 - Artifact & Supply Chain Security
+### M5 - DAST and Runtime Security
 
 **Status:** PLANNED
 
-SBOM ingestion, artifact inventory, and deterministic supply-chain policy.
+**Goal:** Analyze running applications and produce deterministic runtime security evidence.
 
-### M5 - API Security & Fuzzing
+**Candidate engines:** OWASP ZAP and Nuclei.
 
-**Status:** PLANNED
+**Potential scope:**
 
-API contract analysis and controlled fuzzing integrations.
+- **PASSIVE:** passive HTTP analysis.
+- **ACTIVE:** active DAST, API DAST, known-exposure templates, and runtime misconfiguration detection.
 
-### M6 - DAST & Runtime Security
+Active scanning requires explicit authorization/configuration.
 
-**Status:** PLANNED
-
-Dynamic application testing and runtime security evidence.
-
-### M7 - Infrastructure & Kubernetes Security
+### M6 - Infrastructure and Kubernetes Security
 
 **Status:** PLANNED
 
-Infrastructure and Kubernetes-specific policy and coverage.
+**Goal:** Extend Vesper into deployment and infrastructure security while keeping static and live infrastructure evidence separate.
 
-### M8 - Deterministic Evidence Correlation
+**Candidate engines:** Trivy IaC and kube-bench.
+
+**Potential scope:** Kubernetes configuration analysis; CIS Kubernetes checks; static IaC findings; live cluster posture; and deployment configuration.
+
+Live-cluster access must remain explicit and authorized.
+
+### M7 - Deterministic Evidence Correlation
 
 **Status:** PLANNED
 
-Cross-source evidence correlation that preserves deterministic, auditable findings.
+**Goal:** Correlate findings and evidence from independent deterministic engines without mutating or replacing original findings.
 
-### M9 - Centralized Orchestration
+**Potential evidence sources:** Semgrep, Trivy, OSV-Scanner, Grype, Schemathesis, OWASP ZAP, Nuclei, Gitleaks, Syft, and OpenSSF Scorecard.
+
+**Core invariant:**
+
+```text
+original scanner findings
+=
+immutable evidence
+
+correlation
+=
+references between evidence
+```
+
+Never irreversibly merge or destroy original findings.
+
+**Future deterministic correlation may use:** canonical vulnerability identifiers; package identity; endpoint identity; source location; security capability; target identity; and runtime evidence.
+
+Do not use probabilistic correlation or generated severity/gate decisions. Possible explainable states include `STATIC_EVIDENCE`, `BEHAVIORAL_EVIDENCE`, `RUNTIME_CONFIRMED`, and `MULTI_ENGINE_CONFIRMED`; each must be grounded in concrete evidence.
+
+### M8 - Security Policy and Advanced Gating
+
+**Status:** PLANNED
+
+**Goal:** Build richer deterministic policy evaluation on top of baseline comparison, capabilities, and evidence correlation.
+
+**Potential future policies:**
+
+```text
+new HIGH finding
+-> fail
+
+existing HIGH finding
+-> allow under baseline policy
+
+new CRITICAL finding
+-> fail
+
+MEDIUM finding with runtime confirmation
+-> fail
+
+LOW hardening finding
+-> warn
+```
+
+Potential policy inputs are severity, new/existing/changed state, finding nature, security capability, deterministic corroboration, runtime confirmation, and fix availability. Probabilistic scores are excluded.
+
+### M9 - CI/CD Distribution and Ecosystem Integration
+
+**Status:** PLANNED
+
+**Goal:** Make Vesper easy to distribute, version, integrate, and operate inside CI/CD environments after the core security engine is mature.
+
+M9 is not what makes Vesper technically capable of running in CI. Vesper is already developer- and CI-oriented; M9 focuses on supported distribution and ecosystem integration.
+
+**Potential scope:** versioned releases; runner image digest publication; release manifests; `win-x64` and `linux-x64` artifacts; macOS artifacts when verified; GitHub Actions integration; GitLab CI templates; Azure DevOps integration/examples; CircleCI integration/examples; Jenkins examples; report artifact conventions; SARIF export if appropriate; JUnit-style output if appropriate; and release provenance.
+
+Vesper can run in CI before M9. M9 makes CI usage repeatable, supported, packaged, documented, versioned, and integrated. CI distribution is packaging/ecosystem work, not the core security engine.
+
+### M10 - Centralized Orchestration
 
 **Status:** DEFERRED
 
-Hosted APIs/UI, databases, queues, distributed workers, SaaS execution, shared caches, and centralized scheduling remain deferred.
+**Goal:** Introduce centralized multi-user execution only after the local/CI engine and deterministic security capabilities are mature.
+
+**Potential future scope:** REST API; persistent database; queue; workers; Kubernetes Jobs; scan scheduling; central history; multi-user execution; RBAC; tenancy; and centralized policies.
+
+Do not implement this now.
+
+### Roadmap Principle
+
+```text
+Detect
+  ↓
+Prove coverage
+  ↓
+Compare against baseline
+  ↓
+Expand deterministic detection
+  ↓
+Correlate evidence
+  ↓
+Apply advanced policy
+  ↓
+Distribute into CI/CD ecosystems
+  ↓
+Centralize execution
+```
+
+Vesper should first mature its deterministic security capabilities, coverage model, baseline comparison, evidence correlation, and policy model. CI/CD integration is primarily distribution and ecosystem packaging, so it is intentionally scheduled after the core security engine.
+
+Vesper is not differentiated by scanner count. Its architectural value is deterministic evidence, coverage transparency, normalization, baseline comparison, correlation, policy enforcement, and auditability.
 
 ## Security Findings
 
@@ -305,7 +449,7 @@ Hosted APIs/UI, databases, queues, distributed workers, SaaS execution, shared c
 | VSP-002 | High | Scanner parsing | RESOLVED | M1.3 | Empty/invalid JSON, unexpected root type, and normalization exceptions fail the adapter; later adapters continue. |
 | VSP-003 | High | Severity/CVSS | RESOLVED | M1.3 | Only numeric CVSS scores are scored; v2/v3 vectors are preserved and vector-only scores remain unknown. |
 | VSP-004 | High | Confidentiality | RESOLVED | M1.3 | Linux tests confirm archive/report files are `0600` and private output/staging directories are `0700`; Windows ACL inheritance remains documented. |
-| VSP-005 | High | Supply chain | ACCEPTED | Before CI/release | Python package hashes, digest-pinned bases/helper, and OSV checksum are enforced. Residual: default versioned runner tag is mutable and runtime databases/rules are dynamic; digest-qualified override is supported and required for reproducible release use. |
+| VSP-005 | High | Supply chain | ACCEPTED | M9 / before official release distribution | Python package hashes, digest-pinned bases/helper, and OSV checksum are enforced. Residual: default versioned runner tag is mutable and runtime databases/rules are dynamic; digest-qualified override is supported and required for reproducible release use. |
 | VSP-006 | Medium | Reliability | RESOLVED | M1.3 | Injected control/transfer deadlines terminate stalling processes; Linux SIGTERM and cancellation isolation pass against real Docker. Actual daemon loss remains a documented unknown. |
 | VSP-007 | Medium | Workspace integrity | RESOLVED | M1.3 | Linux archive round-trip keeps literal backslash and slash filenames distinct; symlink source entries are skipped. |
 | VSP-008 | Medium | Result extraction | RESOLVED | M1.3 | Linux rejects symlink roots and nested symlink parents; hardlink/FIFO/symlink archive entries are ignored; extraction is staged before publish. |
@@ -361,12 +505,12 @@ Hosted APIs/UI, databases, queues, distributed workers, SaaS execution, shared c
 
 ## Deferred Work
 
-- CI-provider workflows (M3), future M4-M9 capabilities, additional scanners, shared scanner caches, orphan cleanup command, and hosted execution remain future work.
-- A Vesper release-image SBOM may be added as supply-chain metadata; no SBOM ingestion platform is planned here.
+- M3.2 is active and requires fresh database-backed Lynx acceptance; M3.3-M9 deterministic security, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred.
+- Additional scanners, shared scanner caches, and an orphan cleanup command remain future work.
 
 ## Not Implemented Yet
 
-- CI-provider integrations, artifact/SBOM workflows, API fuzzing, DAST, runtime security, expanded infrastructure/Kubernetes analysis, centralized evidence correlation, hosted APIs/UI, databases/queues, and distributed workers.
+- Database-backed Grype acceptance, Gitleaks integration, OpenSSF Scorecard integration, Schemathesis, OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service.
 
 ## Product Readiness
 
@@ -374,15 +518,16 @@ Hosted APIs/UI, databases, queues, distributed workers, SaaS execution, shared c
 |---|---|---|
 | Local developer use | CONDITIONAL | Windows and Linux x64 AOT plus remote Docker are tested; local Docker Desktop bind-mode acceptance and macOS runtime remain unverified. |
 | Internal trusted repositories | READY | Fail-closed coverage, pinned build inputs, Linux filesystem tests, remote scan, and cancellation isolation are verified; Semgrep registry rules remain internal-use-only. |
-| CI security gate | CONDITIONAL | Core exit/report behavior is verified, but M3 CI workflows, published artifacts, digest stamping, and provider-specific acceptance remain out of scope. |
+| CI security gate | CONDITIONAL | Core execution and exit/report behavior are CI-compatible and verified; supported distribution, published artifacts, digest stamping, and provider-specific integrations remain M9 work. |
 | Untrusted repositories | CONDITIONAL | Archive/schema defenses and cancellation isolation are tested; Docker host trust, dynamic scanner egress, daemon-loss cleanup, and global concurrency capacity remain constraints. |
 | Hosted multi-user service | NOT READY | Semgrep rule license restricts service use; remote Docker is host-privileged; no tenancy/scheduler exists. |
 
 ## Next Recommended Work
 
-1. Keep macOS runtime/AOT and actual daemon-disappearance verification as explicit platform/environment validation work.
-2. Make M3 publish the runner manifest digest and CLI together; the default local development tag remains versioned for usability.
-3. Keep Windows AOT republishing on a suitable linker-equipped host as environment verification; M3 remains planned and has not started.
+1. Preserve the completed M2 baseline/diff and new-finding gate evidence while monitoring dynamic scanner data changes.
+2. Keep macOS runtime/AOT and real Docker daemon-disappearance verification as explicit environment/platform validation work.
+3. Complete M3.2 database-backed Grype acceptance after restoring sufficient remote Docker storage; do not begin M3.3.
+4. Do not begin CI/CD ecosystem packaging until M9 unless a small CI smoke test is required to validate an earlier product invariant.
 
 ## Future Development Workflow
 
@@ -401,8 +546,11 @@ Hosted APIs/UI, databases, queues, distributed workers, SaaS execution, shared c
 - Recorded M1.3 as IN PROGRESS and security findings VSP-001 through VSP-014 with statuses and verification.
 - Documented M2 baseline/diff as the next product milestone and recorded CI, DAST, and hosted execution as later/not implemented.
 - Reverified the empty-scan indeterminate exit, read-only workspace, same/different-project concurrency, and current-tree self-scan with the final AOT binary/image.
-- Completed M1.3 after Linux filesystem/AOT/signal integration, scanner-envelope and network-failure tests, archive-entry/metadata bounds, and hash-enforced runner build verification. A final dangling-symlink review added direct attribute checks and Linux regression cases before completion. macOS and real daemon-loss behavior remain explicitly UNVERIFIED; runner digest enforcement is accepted for M3 release work.
+- Completed M1.3 after Linux filesystem/AOT/signal integration, scanner-envelope and network-failure tests, archive-entry/metadata bounds, and hash-enforced runner build verification. A final dangling-symlink review added direct attribute checks and Linux regression cases before completion. macOS and real daemon-loss behavior remain explicitly UNVERIFIED; runner digest enforcement is accepted for M9 release work.
 
 ### 2026-10-02
 
-- Completed M2 baseline creation, semantic identity, all five comparison states, coverage-aware resolution, new-only gate, saved-report reproduction, 58 passing Python tests, passing launcher tests, and the real Lynx unchanged-baseline regression (`NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`). M3 remains planned and has not started.
+- Completed M2 baseline creation, semantic identity, all five comparison states, coverage-aware resolution, new-only gate, saved-report reproduction, 58 passing Python tests, passing launcher tests, and the real Lynx unchanged-baseline regression (`NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`). The M2 milestone remains active for acceptance follow-through; M9 CI/CD distribution remains planned and has not started.
+- Closed M2 after fresh current-schema Lynx Scan A/Scan B acceptance through the verified SSH Docker endpoint. The unchanged comparison was `NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`; the existing absolute HIGH gate remained failed, the baseline delta passed, saved gate reproduction matched, and corrupted comparison handling returned exit 2. Began and completed M3.1 SBOM Foundation with pinned Syft 1.52.0, retained CycloneDX evidence, normalized `components.json`, and the Lynx component regression. M3.2 Grype and later milestones remain untouched.
+- Started M3.2 Artifact Vulnerability Analysis with pinned, checksum-verified Grype 0.119.0 consuming the Syft CycloneDX artifact. Synthetic normalization and deduplication tests pass, but real Lynx Grype acceptance remains IN PROGRESS because the remote Docker filesystem killed Grype during database initialization with exit `-9`; OSV/Trivy/Syft evidence remained preserved and M3.3 was not started.
+- Reproduced and classified the Lynx Grype failure as a runner-container memory-cgroup OOM (`--memory 4g`), not Docker disk exhaustion. A focused Grype run succeeded under the same isolation limits; the full pipeline completed with an explicit 6 GiB limit. Corrected Grype DB metadata extraction from the native descriptor, preserved the four-package `Invoice/packages.config` SBOM gap as an unknown-coverage limitation, and verified 67 Python tests, launcher acceptance, and the rebuilt runner image. M3.2 remains IN PROGRESS pending an operational decision on the default memory limit and real Grype vulnerability corroboration; M3.3 was not started.

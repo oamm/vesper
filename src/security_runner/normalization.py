@@ -26,7 +26,100 @@ def normalize(scanner: str, raw: Any) -> list[dict[str, Any]]:
         return _normalize_osv(raw)
     if scanner == "semgrep":
         return _normalize_semgrep(raw)
+    if scanner == "grype":
+        return _normalize_grype(raw)
     return []
+
+
+def normalize_grype(raw: Any, inventory: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    components = (inventory or {}).get("components") if isinstance(inventory, dict) else []
+    component_by_purl = {str(item.get("purl")): item for item in components if isinstance(item, dict) and item.get("purl")}
+    component_by_semantic = {
+        _component_key(item.get("ecosystem"), item.get("name"), item.get("version")): item
+        for item in components if isinstance(item, dict)
+    }
+    for match in (raw.get("matches") or []) if isinstance(raw, dict) else []:
+        if not isinstance(match, dict):
+            continue
+        vulnerability = match.get("vulnerability") or {}
+        artifact = match.get("artifact") or {}
+        vuln_id = vulnerability.get("id") or "vulnerability"
+        related = match.get("relatedVulnerabilities") or []
+        aliases = [item.get("id") for item in related if isinstance(item, dict) and item.get("id")]
+        identifiers = [vuln_id, *aliases]
+        purl = artifact.get("purl") or artifact.get("PURL")
+        package_name = artifact.get("name") or "unknown"
+        package_version = artifact.get("version") or "unknown"
+        ecosystem = _ecosystem(purl or artifact.get("type")) or "unknown"
+        component = component_by_purl.get(str(purl)) if purl else None
+        if component is None:
+            component = component_by_semantic.get(_component_key(ecosystem, package_name, package_version))
+        occurrences = component.get("occurrences", []) if isinstance(component, dict) else []
+        locations = artifact.get("locations") or []
+        target = occurrences[0].get("path") if occurrences else _grype_location(locations)
+        package = {
+            "name": package_name,
+            "version": package_version,
+            "fixedVersion": _grype_fixed_versions(vulnerability.get("fix")),
+            "ecosystem": ecosystem,
+        }
+        if component:
+            package["componentId"] = component.get("id")
+            package["occurrences"] = occurrences
+            if component.get("purl"):
+                package["purl"] = component["purl"]
+        finding = _finding(
+            "dependency", vuln_id, vulnerability.get("fix", {}).get("state") or vuln_id,
+            vulnerability.get("description"), vulnerability.get("severity"), "grype", vuln_id,
+            target, None, None, [], sorted({value for value in identifiers if str(value).startswith("CVE-")}),
+            _grype_cvss(vulnerability), package,
+            (vulnerability.get("urls") or [vuln_id])[0], vuln_id,
+        )
+        finding["scannerEvidence"][0].update({
+            "nativeFixedVersion": package.get("fixedVersion"),
+            "nativeMatch": {key: artifact.get(key) for key in ("name", "version", "purl", "type") if artifact.get(key) is not None},
+            "databaseStatus": (raw.get("descriptor") or {}).get("db") if isinstance(raw.get("descriptor"), dict) else None,
+        })
+        if component:
+            finding["component"] = {
+                "id": component.get("id"),
+                "purl": component.get("purl"),
+                "occurrences": occurrences,
+            }
+        findings.append(finding)
+    return findings
+
+
+def _component_key(ecosystem: Any, name: Any, version: Any) -> tuple[str, str, str]:
+    return (str(ecosystem or "unknown").casefold(), str(name or "").casefold(), str(version or ""))
+
+
+def _grype_location(locations: Any) -> str:
+    if isinstance(locations, list):
+        for location in locations:
+            if isinstance(location, dict) and location.get("path"):
+                return _normalize_file_path(location["path"])
+    return "sbom"
+
+
+def _grype_fixed_versions(fix: Any) -> str | None:
+    if not isinstance(fix, dict):
+        return None
+    versions = fix.get("versions") or []
+    if not isinstance(versions, list):
+        return None
+    values = sorted({str(value) for value in versions if value})
+    return ", ".join(values) if values else None
+
+
+def _grype_cvss(vulnerability: dict[str, Any]) -> float | None:
+    for entry in vulnerability.get("cvss") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("metrics"), dict):
+            score = entry["metrics"].get("baseScore")
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                return float(score)
+    return None
 
 
 def _normalize_trivy(raw: Any) -> list[dict[str, Any]]:
@@ -251,6 +344,11 @@ def deduplicate(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for key in ("cwe", "cve"):
             existing["security"][key] = sorted(set(existing["security"][key] + finding["security"][key]))
         existing["security"]["identifiers"] = sorted(set(existing["security"]["identifiers"] + finding["security"]["identifiers"]))
+        if finding.get("component") and not existing.get("component"):
+            existing["component"] = finding["component"]
+        if finding.get("package", {}).get("componentId") and not existing.get("package", {}).get("componentId"):
+            existing.setdefault("package", {})["componentId"] = finding["package"]["componentId"]
+            existing["package"]["occurrences"] = finding["package"].get("occurrences", [])
     for finding in merged.values():
         evidence = sorted(finding["scannerEvidence"], key=lambda item: (item["scanner"], item["rawId"], item.get("ruleId", "")))
         detectors = sorted({item["scanner"] for item in evidence})

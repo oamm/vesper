@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from security_runner.models import ScannerContext, ScannerResult
-from security_runner.normalization import normalize
+from security_runner.normalization import normalize, normalize_grype
+from security_runner.components import ComponentError, normalize_components
 
 
 class ScanTimeout(Exception):
@@ -24,6 +25,7 @@ class Scanner(ABC):
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
+        self.extra_artifacts: dict[str, Any] = {}
 
     @abstractmethod
     def can_run(self, context: ScannerContext) -> bool:
@@ -51,6 +53,12 @@ class Scanner(ABC):
     def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
         return {"assessment": "unknown"}
 
+    def findings_from_output(self, raw: dict[str, Any], context: ScannerContext) -> list[dict[str, Any]]:
+        return normalize(self.name, raw)
+
+    def additional_artifacts(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        return {}
+
     def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
         return {}
 
@@ -58,6 +66,7 @@ class Scanner(ABC):
         return coverage
 
     def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
+        self.extra_artifacts = {}
         output_name = self.output_name or self.name
         raw_path = context.raw_dir / f"{output_name}.json"
         raw_relative = f"raw/{output_name}.json"
@@ -130,7 +139,8 @@ class Scanner(ABC):
         findings: list[dict[str, Any]] = []
         if parsed_successfully:
             try:
-                findings = normalize(self.name, safe_raw)
+                findings = self.findings_from_output(safe_raw, context)
+                self.extra_artifacts = self.additional_artifacts(safe_raw, context)
             except Exception as exc:
                 status = "failed"
                 error = f"scanner result normalization failed ({type(exc).__name__})"
@@ -499,6 +509,141 @@ class SastScanner(Scanner):
             command.extend(["--exclude", path])
         command.append(str(context.workspace))
         return command
+
+
+class SyftScanner(Scanner):
+    name = "syft"
+    output_name = "syft.cdx"
+    version_command = ["syft", "version"]
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return context.project.has_files
+
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        return (
+            "not_applicable",
+            "empty_workspace",
+            "Syft requires repository files; project inventory found 0 files and no artifacts.",
+            {"assessment": "not_applicable", "targets": []},
+        )
+
+    def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
+        return {
+            "assessment": "unknown",
+            "targets": [{"path": ".", "state": "attempted", "componentCount": None}],
+            "targetCounts": {"attempted": 1, "completed": 0, "failed": 0},
+        }
+
+    def validate_schema(self, raw: dict[str, Any]) -> str:
+        if raw.get("bomFormat") != "CycloneDX" or not isinstance(raw.get("specVersion"), str):
+            raise ValueError("scanner output schema is unsupported (expected CycloneDX bomFormat and specVersion)")
+        if not isinstance(raw.get("version"), int) or isinstance(raw.get("version"), bool):
+            raise ValueError("scanner output schema is unsupported (expected CycloneDX document version)")
+        if not isinstance(raw.get("components"), list):
+            raise ValueError("scanner output schema is unsupported (expected CycloneDX components array)")
+        return raw["specVersion"]
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        component_count = len(raw["components"])
+        assessment = "complete" if component_count else "limited"
+        return {
+            "assessment": assessment,
+            "inventoryAssessment": "unknown",
+            "targets": [{"path": ".", "state": "completed", "componentCount": component_count}],
+            "targetCounts": {"attempted": 1, "completed": 1, "failed": 0},
+            "componentsProduced": component_count,
+        }
+
+    def findings_from_output(self, raw: dict[str, Any], context: ScannerContext) -> list[dict[str, Any]]:
+        return []
+
+    def additional_artifacts(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        return {"components": normalize_components(raw, "raw/syft.cdx.json")}
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return ["syft", "--quiet", f"dir:{context.workspace}", "--output", "cyclonedx-json"]
+
+
+class GrypeScanner(Scanner):
+    name = "grype"
+    output_name = "grype"
+    version_command = ["grype", "version"]
+
+    def __init__(self, enabled: bool = True):
+        super().__init__(enabled)
+        self.component_inventory: dict[str, Any] | None = None
+        self.syft_coverage: dict[str, Any] = {"assessment": "unknown"}
+
+    def set_input_coverage(self, inventory: dict[str, Any] | None, syft_coverage: dict[str, Any] | None) -> None:
+        self.component_inventory = inventory
+        self.syft_coverage = syft_coverage or {"assessment": "unknown"}
+
+    def _version(self) -> str:
+        try:
+            completed = subprocess.run(self.version_command, capture_output=True, text=True, timeout=10, check=False)
+            match = re.search(r"^Version:\s*(\S+)", completed.stdout or "", re.MULTILINE)
+            return match.group(1) if match else super()._version()
+        except (OSError, subprocess.SubprocessError):
+            return "unavailable"
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return (context.raw_dir / "syft.cdx.json").is_file()
+
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        return (
+            "skipped",
+            "syft_input_unavailable",
+            "Grype was not run because the Syft SBOM input is unavailable.",
+            {"assessment": "not_applicable", "input": "raw/syft.cdx.json"},
+        )
+
+    def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
+        return {
+            "assessment": "unknown",
+            "input": "raw/syft.cdx.json",
+            "inputAssessment": self.syft_coverage.get("assessment", "unknown"),
+            "analysisStatus": "attempted",
+            "targetCounts": {"attempted": 1, "completed": 0, "failed": 0},
+        }
+
+    def validate_schema(self, raw: dict[str, Any]) -> str:
+        if not isinstance(raw.get("matches"), list):
+            raise ValueError("scanner output schema is unsupported (expected Grype matches array)")
+        descriptor = raw.get("descriptor")
+        if not isinstance(descriptor, dict) or descriptor.get("name") not in {None, "grype"}:
+            raise ValueError("scanner output schema is unsupported (expected Grype descriptor)")
+        version = descriptor.get("version")
+        if version is not None and not isinstance(version, str):
+            raise ValueError("scanner output schema is unsupported (expected Grype descriptor version)")
+        return version or "unknown"
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        descriptor = raw.get("descriptor") if isinstance(raw.get("descriptor"), dict) else {}
+        db = descriptor.get("db") if isinstance(descriptor.get("db"), dict) else {}
+        db_status = db.get("status") if isinstance(db.get("status"), dict) else db
+        source_assessment = self.syft_coverage.get("inventoryAssessment")
+        if source_assessment not in {"complete", "limited", "unknown"}:
+            source_assessment = self.syft_coverage.get("assessment", "unknown")
+        assessment = source_assessment if source_assessment in {"complete", "limited", "unknown"} else "unknown"
+        return {
+            "assessment": assessment,
+            "input": "raw/syft.cdx.json",
+            "inputAssessment": assessment,
+            "analysisStatus": "completed",
+            "targetCounts": {"attempted": 1, "completed": 1, "failed": 0},
+            "matchCount": len(raw.get("matches", [])),
+            "database": {
+                key: db_status[key]
+                for key in ("schemaVersion", "built", "from", "path", "valid", "checksum")
+                if key in db_status
+            },
+        }
+
+    def findings_from_output(self, raw: dict[str, Any], context: ScannerContext) -> list[dict[str, Any]]:
+        return normalize_grype(raw, self.component_inventory)
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return ["grype", "--quiet", "sbom:/output/raw/syft.cdx.json", "--output", "json"]
 
 
 def _run_process(command: list[str], cwd: Path, timeout: int) -> tuple[str, str, int]:

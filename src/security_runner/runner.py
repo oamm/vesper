@@ -18,7 +18,8 @@ from security_runner.models import ScannerContext
 from security_runner.normalization import SEVERITY_WEIGHT, deduplicate
 from security_runner.policy import evaluate
 from security_runner.remediations import PRIORITY_BY_SEVERITY, PRIORITY_ORDER, build_remediations
-from security_runner.scanners import OsvScanner, SastScanner, TrivyScanner
+from security_runner.components import ComponentError, component_summary, validate_component_inventory
+from security_runner.scanners import GrypeScanner, OsvScanner, SastScanner, SyftScanner, TrivyScanner
 from security_runner import __version__
 
 EXIT_GATE_FAILED = 1
@@ -30,6 +31,8 @@ SCANNER_CAPABILITIES = {
     "trivy": ("dependency", "secret", "container", "iac"),
     "osv-scanner": ("dependency",),
     "semgrep": ("sast",),
+    "syft": (),
+    "grype": ("dependency",),
 }
 
 
@@ -100,14 +103,28 @@ def run_scan(
         OsvScanner(scanner_config.get("osv", {}).get("enabled", True)),
         SastScanner(scanner_config.get("sast", {}).get("enabled", True)),
     ]
+    if "syft" in scanner_config:
+        scanners.append(SyftScanner(scanner_config.get("syft", {}).get("enabled", False)))
+    if "grype" in scanner_config:
+        scanners.append(GrypeScanner(scanner_config.get("grype", {}).get("enabled", False)))
     all_findings: list[dict[str, Any]] = []
     scanner_results = []
+    component_inventory = None
+    syft_result = None
     for scanner in scanners:
+        if scanner.name == "grype" and hasattr(scanner, "set_input_coverage"):
+            scanner.set_input_coverage(component_inventory, syft_result.get("coverage") if syft_result else None)
         timeout = int(timeout_config.get(scanner.name, timeout_config.get("default", 300)))
         context = ScannerContext(workspace, output, raw_dir, project, timeout, exclude_paths, exclude_files)
         result, findings = scanner.execute(context)
         scanner_results.append(result.report())
+        if scanner.name == "syft":
+            syft_result = result.report()
         all_findings.extend(findings)
+        if "components" in getattr(scanner, "extra_artifacts", {}):
+            if component_inventory is not None:
+                raise ReportConsistencyError("Multiple scanners produced component inventories.")
+            component_inventory = scanner.extra_artifacts["components"]
 
     print("[runner] Normalizing results...", flush=True)
     findings = deduplicate(all_findings)
@@ -147,13 +164,15 @@ def run_scan(
             gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
         else:
             gate = {**gate, "baselineDelta": _baseline_delta(comparison, remediations, config)}
-    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project)
+    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory)
     if comparison is not None:
         summary["baselineComparison"] = {
             "baselineId": comparison["baseline"]["baselineId"],
             "schemaVersion": comparison["schemaVersion"],
         }
     report_schemas = {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2}
+    if component_inventory is not None:
+        report_schemas["components"] = 1
     if comparison is not None:
         report_schemas["comparison"] = comparison["schemaVersion"]
     scan_report = {
@@ -174,12 +193,14 @@ def run_scan(
     project_report = project.report()
     if comparison is not None:
         validate_comparison(comparison, baseline, findings, scan_report)
-    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison)
+    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory)
     (output / "project.json").write_text(json.dumps(project_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "remediations.json").write_text(json.dumps(remediations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "scan.json").write_text(json.dumps(scan_report, indent=2) + "\n", encoding="utf-8")
+    if component_inventory is not None:
+        (output / "components.json").write_text(json.dumps(component_inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if comparison is not None:
         (output / "comparison.json").write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_summary(project.technologies, summary, remediations, scanner_results)
@@ -195,6 +216,7 @@ def _summary(
     execution_status: str,
     scanner_results: list[dict[str, Any]],
     project: Any,
+    component_inventory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
@@ -218,7 +240,7 @@ def _summary(
     }
     coverage_by_capability = _capability_coverage(scanner_results)
     coverage_warnings = _coverage_warnings(scanner_results, project)
-    return {
+    summary = {
         "schemaVersion": 2,
         "generator": {"name": "Vesper", "version": __version__},
         "status": execution_status,
@@ -227,6 +249,22 @@ def _summary(
         "coverage": {"scanners": coverage_by_scanner, "capabilities": coverage_by_capability, "warnings": coverage_warnings},
         "gate": gate,
     }
+    if component_inventory is not None:
+        summary["components"] = component_summary(component_inventory)
+    artifact_findings = [
+        finding for finding in findings
+        if any(evidence.get("scanner") == "grype" for evidence in finding.get("scannerEvidence", []))
+    ]
+    if artifact_findings:
+        summary["artifactVulnerabilities"] = {
+            "findings": len(artifact_findings),
+            "componentsAffected": len({
+                (finding.get("package") or {}).get("componentId")
+                for finding in artifact_findings
+                if (finding.get("package") or {}).get("componentId")
+            }),
+        }
+    return summary
 
 
 def _apply_baseline_gate(
@@ -409,6 +447,7 @@ def _validate_report_consistency(
     summary: dict[str, Any],
     scan: dict[str, Any],
     comparison: dict[str, Any] | None = None,
+    component_inventory: dict[str, Any] | None = None,
 ) -> None:
     def require(condition: bool, message: str) -> None:
         if not condition:
@@ -423,6 +462,8 @@ def _validate_report_consistency(
     require(project.get("sourceFileCount", 0) <= project.get("fileCount", 0), "Project source count exceeds its file count.")
     require(summary.get("schemaVersion") == 2 and scan.get("schemaVersion") == 2, "Unsupported summary or scan report schema version.")
     expected_schemas = {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2}
+    if component_inventory is not None:
+        expected_schemas["components"] = 1
     if comparison is not None:
         expected_schemas["comparison"] = 1
     require(scan.get("reportSchemas") == expected_schemas, "Scan report schema manifest is inconsistent.")
@@ -443,6 +484,31 @@ def _validate_report_consistency(
     require((scan.get("executionStatus") == "incomplete") == (summary.get("gate", {}).get("status") == "indeterminate"), "Incomplete scans must have an indeterminate gate.")
     require(all(finding.get("schemaVersion") == 2 for finding in findings), "Finding schema markers are inconsistent.")
     require(all(remediation.get("schemaVersion") == 2 for remediation in remediations), "Remediation schema markers are inconsistent.")
+    if component_inventory is None:
+        require("components" not in summary, "Component summary exists without a component inventory.")
+    else:
+        try:
+            validate_component_inventory(component_inventory)
+            require(summary.get("components") == component_summary(component_inventory), "Component summary is inconsistent.")
+        except ComponentError as exc:
+            raise ReportConsistencyError(str(exc)) from exc
+    component_ids = {
+        component.get("id") for component in (component_inventory or {}).get("components", [])
+        if isinstance(component, dict)
+    }
+    for finding in findings:
+        if any(evidence.get("scanner") == "grype" for evidence in finding.get("scannerEvidence", [])):
+            component_id = (finding.get("package") or {}).get("componentId")
+            require(component_id in component_ids, "Grype finding references a missing component.")
+    artifact_findings = [
+        finding for finding in findings
+        if any(evidence.get("scanner") == "grype" for evidence in finding.get("scannerEvidence", []))
+    ]
+    if artifact_findings:
+        require(
+            summary.get("artifactVulnerabilities", {}).get("findings") == len(artifact_findings),
+            "Artifact vulnerability summary count is inconsistent.",
+        )
 
     severity_counts = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     category_counts = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}

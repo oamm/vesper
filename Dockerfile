@@ -4,6 +4,8 @@ FROM python:3.11-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637
 
 ARG TRIVY_VERSION=0.58.2
 ARG OSV_SCANNER_VERSION=2.3.3
+ARG SYFT_VERSION=1.52.0
+ARG GRYPE_VERSION=0.119.0
 ARG TARGETARCH=amd64
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -17,6 +19,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SEMGREP_ENABLE_VERSION_CHECK=0
 
 RUN python -c 'import hashlib, os, urllib.request; arch = os.environ["TARGETARCH"]; version = os.environ["OSV_SCANNER_VERSION"]; filename = f"osv-scanner_linux_{arch}"; base = f"https://github.com/google/osv-scanner/releases/download/v{version}"; source = f"/tmp/{filename}"; urllib.request.urlretrieve(f"{base}/{filename}", source); sums = urllib.request.urlopen(f"{base}/osv-scanner_SHA256SUMS").read().decode(); expected = next(line.split()[0] for line in sums.splitlines() if len(line.split()) == 2 and line.split()[1] == filename); digest = hashlib.file_digest(open(source, "rb"), "sha256").hexdigest(); assert digest == expected, "OSV scanner release checksum mismatch"; os.replace(source, "/usr/local/bin/osv-scanner"); os.chmod("/usr/local/bin/osv-scanner", 0o755)'
+
+RUN python -c 'import hashlib, os, urllib.request; arch = os.environ["TARGETARCH"]; version = os.environ["SYFT_VERSION"]; filename = f"syft_{version}_linux_{arch}.tar.gz"; base = f"https://github.com/anchore/syft/releases/download/v{version}"; source = f"/tmp/{filename}"; urllib.request.urlretrieve(f"{base}/{filename}", source); sums = urllib.request.urlopen(f"{base}/syft_{version}_checksums.txt").read().decode(); expected = next(line.split()[0] for line in sums.splitlines() if len(line.split()) >= 2 and line.split()[-1] == filename); digest = hashlib.file_digest(open(source, "rb"), "sha256").hexdigest(); assert digest == expected, "Syft release checksum mismatch"; import tarfile; archive = tarfile.open(source); member = archive.getmember("syft"); extracted = archive.extractfile(member); target = open("/usr/local/bin/syft", "wb"); target.write(extracted.read()); target.close(); os.chmod("/usr/local/bin/syft", 0o755)'
+
+RUN python -c 'import hashlib, os, urllib.request, tarfile; arch = os.environ["TARGETARCH"]; version = os.environ["GRYPE_VERSION"]; filename = f"grype_{version}_linux_{arch}.tar.gz"; base = f"https://github.com/anchore/grype/releases/download/v{version}"; source = f"/tmp/{filename}"; urllib.request.urlretrieve(f"{base}/{filename}", source); sums = urllib.request.urlopen(f"{base}/grype_{version}_checksums.txt").read().decode(); expected = next(line.split()[0] for line in sums.splitlines() if len(line.split()) >= 2 and line.split()[-1] == filename); digest = hashlib.file_digest(open(source, "rb"), "sha256").hexdigest(); assert digest == expected, "Grype release checksum mismatch"; archive = tarfile.open(source); member = archive.getmember("grype"); extracted = archive.extractfile(member); target = open("/usr/local/bin/grype", "wb"); target.write(extracted.read()); target.close(); os.chmod("/usr/local/bin/grype", 0o755)'
 
 COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/trivy
 
