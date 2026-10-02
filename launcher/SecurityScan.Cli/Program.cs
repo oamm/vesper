@@ -22,7 +22,7 @@ internal static class Program
             }
             if (command is "report" or "gate")
             {
-                return RunReportCommand(command, args.Length > 1 ? args[1] : null);
+                return RunReportCommand(command, args[1..]);
             }
             if (command == "scan")
             {
@@ -213,6 +213,7 @@ internal static class Program
         Console.WriteLine("  scan [workspace] [options]  Analyze a repository");
         Console.WriteLine("  inspect                     Inspect the active Docker endpoint");
         Console.WriteLine("  report [output-directory]   Summarize a completed scan");
+        Console.WriteLine("       --html [file]          Write a self-contained human-readable HTML report");
         Console.WriteLine("  gate [output-directory]     Return the saved security gate status");
         Console.WriteLine("  version                     Print Vesper and default image versions");
         Console.WriteLine("Scan options:");
@@ -261,8 +262,39 @@ internal static class Program
         }
     }
 
-    private static int RunReportCommand(string command, string? requestedPath)
+    private static int RunReportCommand(string command, string[] arguments)
     {
+        var requestedPath = (string?)null;
+        var htmlPath = (string?)null;
+        var writeHtml = false;
+        for (var index = 0; index < arguments.Length; index++)
+        {
+            var argument = arguments[index];
+            if (argument.Equals("--html", StringComparison.OrdinalIgnoreCase))
+            {
+                writeHtml = true;
+                if (index + 1 < arguments.Length && !arguments[index + 1].StartsWith("-", StringComparison.Ordinal))
+                {
+                    htmlPath = arguments[++index];
+                }
+            }
+            else if (requestedPath is null)
+            {
+                requestedPath = argument;
+            }
+            else
+            {
+                Console.Error.WriteLine($"[report] Unexpected argument: {argument}");
+                return 3;
+            }
+        }
+
+        if (command == "gate" && writeHtml)
+        {
+            Console.Error.WriteLine("[gate] --html is only supported by the report command.");
+            return 3;
+        }
+
         var reportDirectory = ScanReportLocator.FindLatest(requestedPath ?? "security-results");
         if (reportDirectory is null)
         {
@@ -271,7 +303,9 @@ internal static class Program
         }
 
         using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(reportDirectory, "summary.json")));
+        using var scanDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(reportDirectory, "scan.json")));
         var root = document.RootElement;
+        var scanRoot = scanDocument.RootElement;
         var gate = root.GetProperty("gate");
         var gateStatus = gate.GetProperty("status").GetString() ?? "unknown";
         var hasBaselineDelta = gate.TryGetProperty("baselineDelta", out _);
@@ -290,6 +324,10 @@ internal static class Program
             if (gate.TryGetProperty("reason", out var reason))
             {
                 Console.WriteLine(reason.GetString());
+            }
+            if (TextProperty(scanRoot, "executionStatus") is "incomplete" or "cancelled")
+            {
+                return 2;
             }
             return SecurityGateExitPolicy.FromStatus(gateStatus);
         }
@@ -320,6 +358,22 @@ internal static class Program
                 var priority = remediation.GetProperty("priority").GetString()?.ToUpperInvariant();
                 Console.WriteLine($"[{priority}] {remediation.GetProperty("title").GetString()}");
                 Console.WriteLine($"    {remediation.GetProperty("summary").GetString()}");
+            }
+        }
+        if (writeHtml)
+        {
+            var outputPath = htmlPath is null
+                ? Path.Combine(reportDirectory, "report.html")
+                : Path.GetFullPath(htmlPath);
+            try
+            {
+                ReportHtmlWriter.Write(reportDirectory, outputPath, root, comparisonCounts);
+                Console.WriteLine($"HTML report: {outputPath}");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+            {
+                Console.Error.WriteLine($"[report] Unable to write HTML report: {exception.Message}");
+                return 2;
             }
         }
         return 0;
@@ -411,6 +465,13 @@ internal static class Program
                 .SequenceEqual(scanDelta.GetProperty("failOnNew").EnumerateArray().Select(item => item.GetString()))
             && summaryDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString())
                 .SequenceEqual(scanDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString()));
+    }
+
+    private static string? TextProperty(JsonElement element, string name)
+    {
+        return element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
     }
 
 }

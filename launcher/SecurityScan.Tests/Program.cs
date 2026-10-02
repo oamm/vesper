@@ -758,6 +758,11 @@ static void SavedBaselineComparison()
         findings = new { total = 1 },
         gate = gateData,
         remediations = new { total = 0 },
+        coverage = new
+        {
+            scanners = new { trivy = new { status = "failed", assessment = "unknown" } },
+            warnings = new[] { new { code = "coverage_warning", message = "Coverage is incomplete." } },
+        },
     }));
     File.WriteAllText(Path.Combine(root, "scan.json"), System.Text.Json.JsonSerializer.Serialize(new
     {
@@ -783,12 +788,25 @@ static void SavedBaselineComparison()
             unverified = Array.Empty<object>(),
         },
     }));
+    File.WriteAllText(Path.Combine(root, "findings.json"), "[{\"id\":\"finding-1\",\"severity\":\"high\",\"category\":\"sast\",\"title\":\"<img src=x onerror=alert(1)>\",\"description\":\"<script>alert(1)</script>\",\"location\":{\"file\":\"safe/<path>.cs\",\"line\":7},\"detectors\":[\"test\"],\"scannerEvidence\":[{\"scanner\":\"test\",\"nativeTitle\":\"<b>native</b>\",\"nativeDescription\":\"<script>bad</script>\"}]}]");
+    File.WriteAllText(Path.Combine(root, "remediations.json"), "[]");
 
     try
     {
         var report = RunCli("report", root);
         Check(report.ExitCode == 0 && report.StandardOutput.Contains("NEW", StringComparison.Ordinal),
             $"report should show compact baseline state counts (exit {report.ExitCode}; stdout: {report.StandardOutput}; stderr: {report.StandardError})");
+        var htmlPath = Path.Combine(root, "human-report.html");
+        var html = RunCli("report", root, "--html", htmlPath);
+        Check(html.ExitCode == 0 && File.Exists(htmlPath), "report --html should write a human-readable report");
+        var htmlText = File.ReadAllText(htmlPath);
+        Check(htmlText.Contains("Vesper Security Report", StringComparison.Ordinal)
+            && htmlText.Contains("Baseline comparison", StringComparison.Ordinal)
+            && htmlText.Contains("Security gate failed:", StringComparison.Ordinal)
+            && htmlText.Contains("<!doctype html>", StringComparison.OrdinalIgnoreCase)
+            && htmlText.Contains("&lt;img", StringComparison.Ordinal)
+            && !htmlText.Contains("<img src=x", StringComparison.Ordinal),
+            "HTML report should contain the report title, baseline section, and escaped finding text");
         var gate = RunCli("gate", root);
         Check(gate.ExitCode == 1, "saved baseline-aware gate should preserve its original failed status");
 

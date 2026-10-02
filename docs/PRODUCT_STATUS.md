@@ -149,7 +149,7 @@ Developer / CI
 
 #### Completed
 
-- Empty/no-applicable and partial scanner failures now produce `executionStatus=incomplete`, `securityGate=indeterminate`, and exit 2; only a complete scan can return gate exit 0 or 1.
+- Empty/no-applicable and partial scanner failures now produce `executionStatus=incomplete` and exit 2; scans with no known policy blocker retain `securityGate=indeterminate`, while known policy blockers remain `failed` and carry the execution limitation separately. Only a complete scan can return gate exit 0 or 1.
 - Invalid JSON, unexpected root types, unsupported scanner-specific output envelopes, and normalization exceptions fail only that scanner and allow remaining adapters to run.
 - OSV CVSS vectors are retained as vectors; only numeric scores are scored. Vector-only/malformed/missing scores remain unknown.
 - Source/config/result archives are created mode `0600` on Unix; scan output and extraction staging directories are `0700`, report files are `0600`, and the runner uses restrictive umask.
@@ -278,7 +278,7 @@ M3 decomposition remains:
 ```text
 M3.1 SBOM Foundation                    COMPLETE
      Syft
-M3.2 Artifact Vulnerability Analysis    IN PROGRESS
+M3.2 Artifact Vulnerability Analysis    COMPLETE
      Grype
 M3.3 Repository Secret History          PLANNED
      Gitleaks
@@ -289,7 +289,7 @@ M3.5 M3 Integration and Acceptance      PLANNED
 
 #### M3.2 - Artifact Vulnerability Analysis
 
-**Status:** IN PROGRESS
+**Status:** COMPLETE
 
 Grype 0.119.0 is pinned to the official Linux amd64 release archive and verified against the published checksum during the runner image build. The release is Apache-2.0 licensed. Grype consumes the retained `raw/syft.cdx.json` CycloneDX artifact rather than independently rescanning the workspace. Native output is retained at `raw/grype.json` and normalized into the existing dependency finding model.
 
@@ -297,11 +297,13 @@ Grype findings use the existing `fingerprintVersion: 2` semantic identity: depen
 
 Grype coverage is explicitly derived from the Syft input assessment. `scan.json` records the SBOM input, input coverage, analysis status, match count, and database metadata when Grype emits it. Component presence does not affect the gate, and a missing Grype result cannot prove resolution.
 
-Synthetic tests cover valid and malformed Grype envelopes, process failure, component linkage, PURL identity, fixed-version propagation, Grype/Trivy deduplication, scanner-neutral fingerprints, database metadata retention, and report invariants. The first real Lynx attempt failed with exit `-9`; host kernel logs classified this as `CONSTRAINT_MEMCG` OOM in the runner container, with Grype as the killed process. This was a container memory-limit failure, not disk exhaustion: the Docker host reported a 32 GB filesystem with 19 GB available and 4% inode use, while the runner was limited to 4 GiB. A focused Grype run succeeded under the same 4 GiB isolation constraints, establishing that the full pipeline's aggregate memory pressure triggered the failure. The unchanged full scan reproduced the OOM at 4 GiB and completed at an explicitly raised 6 GiB per-scan limit; the default 4 GiB limit remains insufficient for this Lynx workload.
+Synthetic tests cover valid and malformed Grype envelopes, process failure, component linkage, PURL identity, fixed-version propagation, Grype/Trivy deduplication, scanner-neutral fingerprints, database metadata retention, report invariants, and coverage-loss baseline behavior. The first real Lynx attempt failed with exit `-9`; host kernel logs classified this as `CONSTRAINT_MEMCG` OOM in the runner container, with Grype as the killed process. This was a container memory-limit failure, not disk exhaustion: the Docker host reported a 32 GB filesystem with 19 GB available and 4% inode use, while the runner was limited to 4 GiB. A focused Grype run succeeded under the same 4 GiB isolation constraints, establishing that the full pipeline's aggregate memory pressure triggered the failure. The unchanged full scan reproduced the OOM at 4 GiB and completed at an explicitly raised 6 GiB per-scan limit. The selected policy keeps the bounded 4 GiB default for safer concurrency and documents `--memory 6g` as an explicit override for larger artifact/SBOM workloads; no scanner-specific exception or unlimited memory was added.
 
 The final database-backed Lynx scan used source fallback through the trusted remote SSH Docker endpoint with `--cpus 2 --memory 6g --pids-limit 512`. Scan `3575fa9a-e723-4c09-a7b2-8fa81cf2e7be` completed with 31 findings, 5 remediations, and the existing absolute gate failed on three HIGH findings. Syft produced 596 normalized components and 17,431 occurrences in 12.2 seconds; the raw CycloneDX artifact was 23,437,505 bytes and `components.json` was 6,168,089 bytes. Grype initialized database schema `v6.1.9`, built `2026-10-02T06:31:53Z`, with a valid database URL/checksum identity, and retained a 9,000-byte `raw/grype.json` artifact. It completed in 90.3 seconds with zero matches and therefore contributed no normalized findings or detector corroboration on Lynx.
 
-The four OSV/Trivy-vulnerable packages associated with `Invoice/packages.config` remain absent from the Syft SBOM and consequently absent from Grype's input. This is consistent with Syft cataloging the repository's lockfile/package sources rather than that legacy packages.config input. Grype cannot claim coverage for those packages; its report records `analysisStatus: completed` but `inputAssessment: unknown` and overall coverage `unknown`. The finding set remains the independent OSV/Trivy evidence, not a claim of SBOM completeness. Grype/OSV/Trivy deduplication and detector-set baseline stability pass synthetically; no real Lynx Grype corroboration was available because Grype reported zero matches.
+The four OSV/Trivy-vulnerable packages associated with `Invoice/packages.config` remain absent from the Syft SBOM and consequently absent from Grype's input. This is consistent with Syft cataloging the repository's lockfile/package sources rather than that legacy packages.config input. Grype cannot claim coverage for those packages; its report records `analysisStatus: completed` but `inputAssessment: unknown` and overall coverage `unknown`. The finding set remains the independent OSV/Trivy evidence, not a claim of SBOM completeness.
+
+The real vulnerable fixture acceptance used the existing npm `minimist@0.0.8` fixture with the live Syft and Grype engines under the explicit 6 GiB limit. Scan `ab6650a1-9bf6-49b2-97fd-f9fd53872a77` emitted the component `pkg:npm/minimist@0.0.8` at `package-lock.json`; Grype produced `GHSA-xvch-5gv4-984h` (CRITICAL, fixed `0.2.4`) and `GHSA-vh95-rmgr-6w4m` (MEDIUM, fixed `0.2.1`). Each normalized finding retained its component ID, PURL, occurrence, native Grype evidence, database metadata, and existing remediation selection. OSV and Trivy corroborated both findings, producing one semantic finding per vulnerability with detector sets `grype`, `osv-scanner`, and `trivy`. The fixture scan completed with 39 findings and 38 remediations; baseline `baseline-5ffffdf8e8f05961615f6120ea571999073d0dc790ac3b6e4e735ab5bd2f8ac7` and unchanged scan `0c18c2e6-be56-4479-bdec-59edf905da86` recorded `NEW=0`, `EXISTING=39`, `CHANGED=0`, `RESOLVED=0`, and `UNVERIFIED=0`. The four-package Lynx `packages.config` gap remains a documented input-coverage limitation.
 
 ### M4 - API Security and Fuzzing
 
@@ -445,7 +447,7 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 | ID | Severity | Area | Status | Target | Summary |
 |---|---|---|---|---|---|
-| VSP-001 | High | Gate | RESOLVED | M1.3 | No applicable scanner or any applicable scanner failure yields an indeterminate gate and exit 2. |
+| VSP-001 | High | Gate | RESOLVED | M1.3 | No applicable scanner or an applicable scanner failure yields an indeterminate gate when no known policy blocker exists, and exit 2. |
 | VSP-002 | High | Scanner parsing | RESOLVED | M1.3 | Empty/invalid JSON, unexpected root type, and normalization exceptions fail the adapter; later adapters continue. |
 | VSP-003 | High | Severity/CVSS | RESOLVED | M1.3 | Only numeric CVSS scores are scored; v2/v3 vectors are preserved and vector-only scores remain unknown. |
 | VSP-004 | High | Confidentiality | RESOLVED | M1.3 | Linux tests confirm archive/report files are `0600` and private output/staging directories are `0700`; Windows ACL inheritance remains documented. |
@@ -462,7 +464,7 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 ### Resolved Finding Evidence
 
-- **VSP-001:** `test_empty_workspace_with_no_applicable_scanners_is_incomplete`, `test_all_applicable_scanners_failed_is_incomplete`, and `test_parser_failure_isolated_and_run_marked_incomplete`; remote empty-workspace scan returned 2 and exported incomplete/indeterminate reports.
+- **VSP-001:** `test_empty_workspace_with_no_applicable_scanners_is_incomplete`, `test_all_applicable_scanners_failed_is_incomplete`, `test_known_policy_blockers_remain_failed_when_execution_is_incomplete`, and `test_parser_failure_isolated_and_run_marked_incomplete`; remote empty-workspace scan returned 2 and exported incomplete/indeterminate reports, while the blocker regression preserved a failed policy decision with exit 2.
 - **VSP-002:** `test_invalid_json_and_unexpected_json_types_fail_scanner` and the parser-orchestration test prove a later clean adapter runs while overall execution stays incomplete.
 - **VSP-003:** `test_osv_cvss_numeric_scores_and_vectors` covers numeric score, CVSS v2/v3.0/v3.1, malformed, and missing values. A vector never becomes a score.
 - **VSP-011:** Docker target pinning unit test and remote AOT `inspect`, empty, fixture, and concurrent scans.
@@ -505,12 +507,12 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 ## Deferred Work
 
-- M3.2 is active and requires fresh database-backed Lynx acceptance; M3.3-M9 deterministic security, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred.
+- M3.3-M9 deterministic security, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred. Large artifact/SBOM scans may require an explicit memory override above the bounded 4 GiB default.
 - Additional scanners, shared scanner caches, and an orphan cleanup command remain future work.
 
 ## Not Implemented Yet
 
-- Database-backed Grype acceptance, Gitleaks integration, OpenSSF Scorecard integration, Schemathesis, OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service.
+- Gitleaks integration, OpenSSF Scorecard integration, Schemathesis, OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service.
 
 ## Product Readiness
 
@@ -526,7 +528,7 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 1. Preserve the completed M2 baseline/diff and new-finding gate evidence while monitoring dynamic scanner data changes.
 2. Keep macOS runtime/AOT and real Docker daemon-disappearance verification as explicit environment/platform validation work.
-3. Complete M3.2 database-backed Grype acceptance after restoring sufficient remote Docker storage; do not begin M3.3.
+3. Preserve the completed M3.2 evidence and keep M3.3 planned; do not begin M3.3 in this acceptance task.
 4. Do not begin CI/CD ecosystem packaging until M9 unless a small CI smoke test is required to validate an earlier product invariant.
 
 ## Future Development Workflow
@@ -554,3 +556,8 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 - Closed M2 after fresh current-schema Lynx Scan A/Scan B acceptance through the verified SSH Docker endpoint. The unchanged comparison was `NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`; the existing absolute HIGH gate remained failed, the baseline delta passed, saved gate reproduction matched, and corrupted comparison handling returned exit 2. Began and completed M3.1 SBOM Foundation with pinned Syft 1.52.0, retained CycloneDX evidence, normalized `components.json`, and the Lynx component regression. M3.2 Grype and later milestones remain untouched.
 - Started M3.2 Artifact Vulnerability Analysis with pinned, checksum-verified Grype 0.119.0 consuming the Syft CycloneDX artifact. Synthetic normalization and deduplication tests pass, but real Lynx Grype acceptance remains IN PROGRESS because the remote Docker filesystem killed Grype during database initialization with exit `-9`; OSV/Trivy/Syft evidence remained preserved and M3.3 was not started.
 - Reproduced and classified the Lynx Grype failure as a runner-container memory-cgroup OOM (`--memory 4g`), not Docker disk exhaustion. A focused Grype run succeeded under the same isolation limits; the full pipeline completed with an explicit 6 GiB limit. Corrected Grype DB metadata extraction from the native descriptor, preserved the four-package `Invoice/packages.config` SBOM gap as an unknown-coverage limitation, and verified 67 Python tests, launcher acceptance, and the rebuilt runner image. M3.2 remains IN PROGRESS pending an operational decision on the default memory limit and real Grype vulnerability corroboration; M3.3 was not started.
+- Completed M3.2 with the existing vulnerable npm fixture: live Syft-to-Grype DB-backed matching, component linkage, Grype/OSV/Trivy corroboration, remediation preservation, unchanged baseline comparison, and conservative coverage-loss behavior. Kept the bounded 4 GiB default and documented explicit 6 GiB guidance for larger artifact workloads. M3.3 remains planned and was not started.
+- Added `vesper report --html [file]`, a self-contained HTML export rendered by the host CLI from validated saved report artifacts. It presents gate and execution status, scanner coverage, findings, remediation actions, and baseline comparison counts. Launcher acceptance now verifies the export and its key sections; PDF generation remains out of scope.
+- Hardened the HTML export for schema-v2 scanner coverage objects and structured coverage warnings after validating it against the Lynx report with 31 findings and 5 remediations; the export now completes without an unhandled exception.
+- Expanded the HTML report with independent execution/gate/coverage assessments, effective policy metadata, prioritized remediations, scanner scope and diagnostics, safe artifact links, escaped expandable finding evidence, offline filters, and reproducibility metadata. Added additive schema-v2 `coverage.assessment`, `effectivePolicy`, project identity, and optional launcher-captured Git metadata. Known policy blockers now remain a failed decision when execution is incomplete, while scan and saved-gate exit code `2` semantics remain intact.
+- Removed the obsolete legacy Docker image tag from the documented build surface; `vesper-runner` is the only supported runner image name. The `security_runner` Python package and `security-scan` script aliases remain unchanged.

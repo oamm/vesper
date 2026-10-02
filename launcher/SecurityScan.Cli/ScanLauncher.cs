@@ -18,6 +18,7 @@ public sealed class BaselineInputException(string message) : Exception(message);
 public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClient = null)
 {
     private readonly DockerClient docker = dockerClient ?? new DockerClient();
+    private RepositoryMetadata repositoryMetadata = RepositoryMetadata.Empty;
 
     public async Task<int> RunAsync(CancellationToken cancellationToken)
     {
@@ -26,6 +27,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         {
             throw new DirectoryNotFoundException($"Workspace does not exist: {workspace}");
         }
+        repositoryMetadata = RepositoryMetadata.Capture(workspace);
 
         var outputRoot = options.Output is null
             ? Path.Combine(workspace, "security-results")
@@ -492,6 +494,13 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             $"--memory={options.ResourceLimits.Memory}",
             $"--pids-limit={options.ResourceLimits.PidsLimit}",
         ]);
+        foreach (var item in repositoryMetadata.EnvironmentValues)
+        {
+            arguments.Add("--env");
+            arguments.Add($"{item.Key}={item.Value}");
+        }
+        arguments.Add("--env");
+        arguments.Add($"SECURITY_SCAN_PROJECT_NAME={Path.GetFileName(options.Workspace.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))}");
         if (!string.IsNullOrWhiteSpace(execution.OutputExclusionPath))
         {
             arguments.Add("--env");
