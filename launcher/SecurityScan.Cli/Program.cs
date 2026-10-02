@@ -278,7 +278,11 @@ internal static class Program
 
         Console.WriteLine("Vesper Security Report");
         Console.WriteLine($"Directory: {reportDirectory}");
-        Console.WriteLine($"Findings: {root.GetProperty("total").GetInt32()}");
+        var findingsTotal = root.TryGetProperty("findings", out var findingsSummary)
+            && findingsSummary.TryGetProperty("total", out var canonicalTotal)
+                ? canonicalTotal.GetInt32()
+                : root.GetProperty("total").GetInt32();
+        Console.WriteLine($"Findings: {findingsTotal}");
         Console.WriteLine($"Remediations: {root.GetProperty("remediations").GetProperty("total").GetInt32()}");
         Console.WriteLine($"Security Gate: {gateStatus.ToUpperInvariant()}");
         var remediationPath = Path.Combine(reportDirectory, "remediations.json");

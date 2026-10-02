@@ -20,6 +20,12 @@ EXIT_RUNNER_FAILED = 2
 EXIT_CONFIG_ERROR = 3
 EXIT_INTERNAL_ERROR = 4
 
+SCANNER_CAPABILITIES = {
+    "trivy": ("dependency", "secret", "container", "iac"),
+    "osv-scanner": ("dependency",),
+    "semgrep": ("sast",),
+}
+
 
 class ConfigurationError(Exception):
     pass
@@ -150,11 +156,9 @@ def _summary(
 ) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
-    category_severity = {category: dict.fromkeys(severities, 0) for category in categories}
     for finding in findings:
         severities[finding["severity"]] += 1
         categories[finding["category"]] += 1
-        category_severity[finding["category"]][finding["severity"]] += 1
     priorities = {priority: 0 for priority in PRIORITY_ORDER}
     for remediation in remediations:
         priorities[remediation["priority"]] += 1
@@ -165,24 +169,57 @@ def _summary(
             "assessment": (result.get("coverage") or {}).get("assessment", "unknown"),
             "reasonCode": result.get("reasonCode"),
             "reason": result.get("reason"),
-            "metrics": result.get("coverage") or {},
+            "targets": _coverage_target_counts(result.get("coverage") or {}),
+            "metrics": _compact_coverage_metrics(result.get("coverage") or {}),
         }
         for result in scanner_results
     }
+    coverage_by_capability = _capability_coverage(scanner_results)
     coverage_warnings = _coverage_warnings(scanner_results, project)
     return {
         "schemaVersion": 2,
         "generator": {"name": "Vesper", "version": __version__},
         "status": execution_status,
-        "total": len(findings),
-        "severity": severities,
-        "categories": categories,
-        "categorySeverity": category_severity,
         "findings": {"total": len(findings), "severity": severities, "categories": categories},
         "remediations": {"total": len(remediations), "priority": priorities},
-        "coverage": {"scanners": coverage_by_scanner, "warnings": coverage_warnings},
+        "coverage": {"scanners": coverage_by_scanner, "capabilities": coverage_by_capability, "warnings": coverage_warnings},
         "gate": gate,
     }
+
+
+def _capability_coverage(scanner_results: list[dict[str, Any]]) -> dict[str, Any]:
+    scanners_by_name = {result["name"]: result for result in scanner_results}
+    capability_scanners: dict[str, list[str]] = {}
+    for scanner, capabilities in SCANNER_CAPABILITIES.items():
+        for capability in capabilities:
+            capability_scanners.setdefault(capability, []).append(scanner)
+
+    rank = {"not_applicable": 0, "complete": 1, "limited": 2, "partial": 3, "unknown": 4}
+    capabilities = {}
+    for capability, scanner_names in sorted(capability_scanners.items()):
+        detectors = {}
+        applicable_assessments = []
+        for name in scanner_names:
+            result = scanners_by_name.get(name)
+            if result is None:
+                continue
+            coverage = result.get("coverage") or {}
+            capability_evidence = (coverage.get("capabilities") or {}).get(capability, {})
+            assessment = capability_evidence.get("assessment", coverage.get("assessment", "unknown"))
+            detectors[name] = {"status": result["status"], "assessment": assessment}
+            if capability_evidence.get("requested") is not None:
+                detectors[name]["requested"] = capability_evidence["requested"]
+            if result["status"] not in {"skipped", "not_applicable", "unsupported_manifest"}:
+                applicable_assessments.append(assessment)
+            elif result["status"] == "unsupported_manifest":
+                applicable_assessments.append("partial")
+
+        if not applicable_assessments:
+            overall = "not_applicable"
+        else:
+            overall = max(applicable_assessments, key=lambda value: rank.get(value, rank["unknown"]))
+        capabilities[capability] = {"assessment": overall, "detectors": detectors}
+    return capabilities
 
 
 def _coverage_warnings(scanner_results: list[dict[str, Any]], project: Any) -> list[dict[str, Any]]:
@@ -191,11 +228,16 @@ def _coverage_warnings(scanner_results: list[dict[str, Any]], project: Any) -> l
         coverage = result.get("coverage") or {}
         assessment = coverage.get("assessment", "unknown")
         if result["status"] == "unsupported_manifest":
+            unsupported_count = coverage.get("unsupportedInputCount") or (
+                coverage.get("unsupportedManifestCount", 0) + coverage.get("unsupportedProjectCount", 0)
+            )
             warnings.append({
                 "code": result.get("reasonCode") or "unsupported_manifest",
                 "scanner": result["name"],
-                "message": result.get("reason") or "Detected dependency manifests are not supported by this scanner.",
-                "artifacts": coverage.get("unsupportedArtifacts", []),
+                "message": f"{unsupported_count} dependency input(s) lack supported scanner coverage; see project.json.",
+                "artifactCount": unsupported_count,
+                "detailsLocation": "project.json",
+                "executionLocation": "scan.json",
             })
         elif result["status"] == "not_applicable" and coverage.get("candidateArtifacts"):
             warnings.append({
@@ -205,8 +247,13 @@ def _coverage_warnings(scanner_results: list[dict[str, Any]], project: Any) -> l
                 "artifacts": coverage["candidateArtifacts"],
             })
         elif assessment in {"partial", "limited"}:
-            unsupported = coverage.get("unsupportedArtifacts", [])
-            details = f"Unsupported detected artifacts: {', '.join(unsupported)}." if unsupported else ""
+            unsupported_count = coverage.get("unsupportedInputCount") or (
+                coverage.get("unsupportedManifestCount", 0) + coverage.get("unsupportedProjectCount", 0)
+            )
+            details = (
+                f"{unsupported_count} unsupported dependency input(s); see project.json for details."
+                if unsupported_count else ""
+            )
             if result["name"] == "semgrep":
                 partials = []
                 if coverage.get("filesSkipped"):
@@ -219,7 +266,11 @@ def _coverage_warnings(scanner_results: list[dict[str, Any]], project: Any) -> l
                 "code": f"{result['name']}_{assessment}_coverage",
                 "scanner": result["name"],
                 "message": details or result.get("reason") or f"{result['name']} reported {assessment} coverage.",
-                **({"artifacts": unsupported} if unsupported else {}),
+                **({
+                    "artifactCount": unsupported_count,
+                    "detailsLocation": "project.json",
+                    "executionLocation": "scan.json",
+                } if unsupported_count else {}),
             })
         elif assessment == "unknown" and result["status"] in {"clean", "completed_with_findings"}:
             warnings.append({
@@ -235,6 +286,26 @@ def _coverage_warnings(scanner_results: list[dict[str, Any]], project: Any) -> l
             "message": "Generated, transient, output, or explicitly excluded paths were omitted; see project.json for the exact list.",
         })
     return sorted(warnings, key=lambda item: (item.get("scanner", ""), item.get("code", ""), item.get("path", "")))
+
+
+def _coverage_target_counts(coverage: dict[str, Any]) -> dict[str, int]:
+    counts = coverage.get("targetCounts")
+    if isinstance(counts, dict) and all(isinstance(value, int) and not isinstance(value, bool) for value in counts.values()):
+        return dict(sorted(counts.items()))
+    return {}
+
+
+def _compact_coverage_metrics(coverage: dict[str, Any]) -> dict[str, Any]:
+    detail_keys = {
+        "assessment", "filesDiscovered", "filesAnalyzed", "filesSkipped", "sourceFilesDiscovered",
+        "sourceFilesAnalyzed", "sourceFilesSkipped", "csharpFilesDiscovered", "csharpFilesAnalyzed",
+        "pathsReportedScanned", "pathsReportedSkipped", "rulesLoaded", "rulesSkipped", "parseErrors",
+        "errors", "ruleLoadStatus", "rulesetsConfigured", "resultSourcesWithFindings",
+    }
+    return {
+        key: value for key, value in coverage.items()
+        if key in detail_keys and (value is None or isinstance(value, (str, int, float, bool)))
+    }
 
 
 def _validate_report_consistency(
@@ -266,22 +337,17 @@ def _validate_report_consistency(
 
     severity_counts = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     category_counts = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
-    category_severity = {category: {severity: 0 for severity in severity_counts} for category in category_counts}
     for finding in findings:
         require(finding.get("severity") in severity_counts, "Finding has an unsupported severity.")
         require(finding.get("category") in category_counts, "Finding has an unsupported category.")
         severity_counts[finding["severity"]] += 1
         category_counts[finding["category"]] += 1
-        category_severity[finding["category"]][finding["severity"]] += 1
 
-    require(summary.get("total") == len(findings), "Legacy summary finding total is inconsistent.")
-    require(summary.get("severity") == severity_counts, "Legacy severity counts are inconsistent.")
-    require(summary.get("categories") == category_counts, "Legacy category counts are inconsistent.")
     require(summary.get("findings", {}).get("total") == len(findings), "Canonical finding total is inconsistent.")
     require(summary.get("findings", {}).get("severity") == severity_counts, "Canonical severity counts are inconsistent.")
     require(summary.get("findings", {}).get("categories") == category_counts, "Canonical category counts are inconsistent.")
-    require(summary.get("categorySeverity") == category_severity, "Category/severity matrix is inconsistent.")
-    require(sum(summary.get("severity", {}).values()) == len(findings), "Severity total does not match findings.")
+    require(sum(summary.get("findings", {}).get("categories", {}).values()) == len(findings), "Category total does not match findings.")
+    require(sum(summary.get("findings", {}).get("severity", {}).values()) == len(findings), "Severity total does not match findings.")
 
     for remediation in remediations:
         affected = remediation.get("affectedFindings", [])
@@ -336,14 +402,15 @@ def _print_summary(
     remediations: list[dict[str, Any]],
     scanner_results: list[dict[str, Any]],
 ) -> None:
+    finding_summary = summary["findings"]
     print("\nVesper Security Scan", flush=True)
     print(f"Status        {summary['status'].upper()}", flush=True)
     print(f"Technologies  {', '.join(technologies) if technologies else 'Unknown'}", flush=True)
-    print(f"Findings      {summary['total']}", flush=True)
+    print(f"Findings      {finding_summary['total']}", flush=True)
     print(f"Remediations  {len(remediations)}", flush=True)
     print("\nSeverity", flush=True)
     for severity in ("critical", "high", "medium", "low", "info", "unknown"):
-        print(f"  {severity.title():<10} {summary['severity'][severity]}", flush=True)
+        print(f"  {severity.title():<10} {finding_summary['severity'][severity]}", flush=True)
 
     gate = summary["gate"]
     print("\nVesper Security Gate", flush=True)

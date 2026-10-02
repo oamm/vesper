@@ -58,6 +58,7 @@ def detect_project(root: Path, exclude_paths: set[str] | None = None) -> Project
 
     technologies: set[str] = set()
     artifacts: set[str] = set()
+    project_descriptors: list[str] = []
     lockfiles: list[str] = []
     dependency_manifests: set[str] = set()
     source_files: list[str] = []
@@ -72,7 +73,10 @@ def detect_project(root: Path, exclude_paths: set[str] | None = None) -> Project
             source_files.append(relative)
         is_dotnet_project = name.endswith((".csproj", ".fsproj", ".vbproj"))
         is_dotnet_solution = name.endswith(".sln")
-        if name in DEPENDENCY_CANDIDATE_NAMES or name.endswith(".deps.json") or is_dotnet_project:
+        if is_dotnet_project or is_dotnet_solution:
+            project_descriptors.append(relative)
+            artifacts.add(relative)
+        if name in DEPENDENCY_CANDIDATE_NAMES or name.endswith(".deps.json"):
             dependency_manifests.add(relative)
             artifacts.add(relative)
         if name in LOCKFILE_NAMES or name.endswith(".deps.json"):
@@ -133,14 +137,30 @@ def detect_project(root: Path, exclude_paths: set[str] | None = None) -> Project
         if manifest not in lockfiles and _is_covered_by_sibling_lock(manifest, lockfiles)
     )
     unsupported_manifests = sorted(dependency_manifests - set(lockfiles) - set(covered_manifests))
+    dotnet_projects = []
+    unsupported_dotnet_projects = []
+    for descriptor in sorted(path for path in project_descriptors if Path(path).suffix.casefold() in {".csproj", ".fsproj", ".vbproj"}):
+        inputs = _dotnet_project_inputs(descriptor, lockfiles)
+        if not inputs:
+            unsupported_dotnet_projects.append(descriptor)
+        dotnet_projects.append({
+            "name": Path(descriptor).stem,
+            "projectDescriptor": descriptor,
+            "scannerInputs": inputs,
+            "coverage": "supported" if inputs else "unsupported",
+            "scope": _classify_project_scope(descriptor),
+        })
 
     return Project(
         technologies=[technology for technology in TECH_ORDER if technology in technologies],
         artifacts=sorted(artifacts),
+        project_descriptors=sorted(project_descriptors),
+        dotnet_projects=dotnet_projects,
         lockfiles=sorted(set(lockfiles)),
         dependency_manifests=sorted(dependency_manifests),
         covered_dependency_manifests=covered_manifests,
         unsupported_dependency_manifests=unsupported_manifests,
+        unsupported_dependency_projects=unsupported_dotnet_projects,
         source_files=sorted(source_files),
         artifact_summary=dict(sorted(artifact_summary.items())),
         exclusions=[{"path": path, "reason": reason} for path, reason in sorted(exclusions.items())],
@@ -172,6 +192,39 @@ def _is_covered_by_sibling_lock(manifest: str, lockfiles: list[str]) -> bool:
         Path(lockfile).parent.as_posix() == parent and Path(lockfile).name.casefold() in sibling_locks
         for lockfile in lockfiles
     )
+
+
+def _dotnet_project_inputs(project_descriptor: str, lockfiles: list[str]) -> list[str]:
+    project_path = Path(project_descriptor)
+    project_parent = project_path.parent.as_posix()
+    project_stem = project_path.stem.casefold()
+    inputs = []
+    for lockfile in lockfiles:
+        lock_path = Path(lockfile)
+        lock_name = lock_path.name.casefold()
+        same_directory = lock_path.parent.as_posix() == project_parent
+        if same_directory and lock_name in {"packages.lock.json", "packages.config"}:
+            inputs.append(lockfile)
+            continue
+        is_descendant = project_parent == "." or lock_path.parent.as_posix().startswith(f"{project_parent}/")
+        if is_descendant and lock_name.endswith(".deps.json") and lock_path.name[:-len(".deps.json")].casefold() == project_stem:
+            inputs.append(lockfile)
+    return sorted(inputs)
+
+
+def _classify_project_scope(project_descriptor: str) -> str:
+    path = Path(project_descriptor)
+    parts = [part.casefold() for part in path.parts]
+    name = path.stem.casefold()
+    if any(part in {"test", "tests", "unittest", "__tests__"} for part in parts) or name.endswith((".test", ".tests")):
+        return "test"
+    if any(part in {"benchmark", "benchmarks"} for part in parts) or "benchmark" in name:
+        return "benchmark"
+    if any(part in {"migration", "migrations"} for part in parts) or "migration" in name:
+        return "migration"
+    if any(part in {"tool", "tools", "tooling", "scripts"} for part in parts) or name.endswith((".tool", ".tools")):
+        return "tooling"
+    return "unknown"
 
 
 def _artifact_kind(name: str, suffix: str) -> str | None:

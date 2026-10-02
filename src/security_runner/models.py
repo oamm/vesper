@@ -7,10 +7,13 @@ from typing import Any
 class Project:
     technologies: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
+    project_descriptors: list[str] = field(default_factory=list)
+    dotnet_projects: list[dict[str, Any]] = field(default_factory=list)
     lockfiles: list[str] = field(default_factory=list)
     dependency_manifests: list[str] = field(default_factory=list)
     covered_dependency_manifests: list[str] = field(default_factory=list)
     unsupported_dependency_manifests: list[str] = field(default_factory=list)
+    unsupported_dependency_projects: list[str] = field(default_factory=list)
     source_files: list[str] = field(default_factory=list)
     artifact_summary: dict[str, int] = field(default_factory=dict)
     exclusions: list[dict[str, str]] = field(default_factory=list)
@@ -27,10 +30,21 @@ class Project:
             "artifactCount": len(self.artifacts),
             "fileCount": self.file_count,
             "sourceFileCount": len(self.source_files),
+            "projectDescriptors": self.project_descriptors,
+            "dotnetProjects": self.dotnet_projects,
+            "dependencyInventory": {
+                "projects": len(self.dotnet_projects),
+                "projectsWithSupportedInputs": sum(bool(project["scannerInputs"]) for project in self.dotnet_projects),
+                "projectsWithoutSupportedInputs": len(self.unsupported_dependency_projects),
+                "dependencyManifests": len(self.dependency_manifests),
+                "scannerInputs": len(self.lockfiles),
+                "unsupportedManifests": len(self.unsupported_dependency_manifests),
+            },
             "dependencyManifests": self.dependency_manifests,
             "supportedDependencyManifests": self.lockfiles,
             "coveredDependencyManifests": self.covered_dependency_manifests,
             "unsupportedDependencyManifests": self.unsupported_dependency_manifests,
+            "unsupportedDependencyProjects": self.unsupported_dependency_projects,
             "exclusions": self.exclusions,
         }
 

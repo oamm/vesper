@@ -148,10 +148,14 @@ def _finding(category: str, finding_type: Any, title: Any, description: Any, sev
     cve_list = cve if isinstance(cve, list) else [cve] if cve else []
     location_file = _safe_text(_normalize_file_path(path))
     package_value = package if isinstance(package, dict) and package.get("name") else None
-    identity_key = sorted(cve_list)[0] if cve_list else type_value
+    identity_key = sorted(str(value).casefold() for value in cve_list)[0] if cve_list else type_value.casefold()
     components = [category, identity_key, location_file, str(line or "")]
     if package_value:
-        components.extend([str(package_value.get("name") or ""), str(package_value.get("version") or "")])
+        components.extend([
+            str(package_value.get("ecosystem") or "unknown").casefold(),
+            str(package_value.get("name") or "").casefold(),
+            str(package_value.get("version") or ""),
+        ])
     fingerprint = hashlib.sha256("|".join(components).encode("utf-8")).hexdigest()
     cwe_out = sorted({_safe_text(value) for value in cwe_list if value})
     cve_out = sorted({_safe_text(value) for value in cve_list if value})
@@ -175,6 +179,7 @@ def _finding(category: str, finding_type: Any, title: Any, description: Any, sev
     impact = {"type": _impact_type(category, cwe_out, title, description)}
     return {
         "schemaVersion": 2,
+        "fingerprintVersion": 2,
         "id": f"finding-{fingerprint[:20]}",
         "fingerprint": fingerprint,
         "category": category,
@@ -197,6 +202,7 @@ def _finding(category: str, finding_type: Any, title: Any, description: Any, sev
         "evidence": {"message": _safe_text(evidence or "")},
         "scannerEvidence": [{
             "scanner": scanner,
+            "ruleId": _safe_text(rule_id or ""),
             "rawId": native_id,
             "nativeId": native_id,
             "nativeTitle": native_title,
@@ -245,6 +251,19 @@ def deduplicate(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for key in ("cwe", "cve"):
             existing["security"][key] = sorted(set(existing["security"][key] + finding["security"][key]))
         existing["security"]["identifiers"] = sorted(set(existing["security"]["identifiers"] + finding["security"]["identifiers"]))
+    for finding in merged.values():
+        evidence = sorted(finding["scannerEvidence"], key=lambda item: (item["scanner"], item["rawId"], item.get("ruleId", "")))
+        detectors = sorted({item["scanner"] for item in evidence})
+        primary = evidence[0]
+        finding["scannerEvidence"] = evidence
+        finding["detectors"] = detectors
+        finding["corroboration"] = {"detectorCount": len(detectors), "detectors": detectors}
+        finding["primaryScanner"] = {
+            "name": primary["scanner"],
+            "ruleId": primary.get("ruleId", ""),
+            "selectionReason": "stable_lexicographic_compatibility_alias",
+        }
+        finding["scanner"] = {"name": primary["scanner"], "ruleId": primary.get("ruleId", "")}
     return sorted(
         merged.values(),
         key=lambda item: (

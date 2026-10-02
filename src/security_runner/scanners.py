@@ -51,6 +51,12 @@ class Scanner(ABC):
     def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
         return {"assessment": "unknown"}
 
+    def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
+        return {}
+
+    def finalize_coverage(self, coverage: dict[str, Any], status: str) -> dict[str, Any]:
+        return coverage
+
     def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
         output_name = self.output_name or self.name
         raw_path = context.raw_dir / f"{output_name}.json"
@@ -62,7 +68,7 @@ class Scanner(ABC):
         error = None
         reason = None
         reason_code = None
-        coverage: dict[str, Any] = {}
+        coverage = self.initial_coverage(context)
         raw: Any = {}
         version = self._version()
         process_returncode: int | None = None
@@ -73,6 +79,7 @@ class Scanner(ABC):
             status = "skipped"
             reason_code = "disabled_by_configuration"
             reason = "disabled by configuration"
+            coverage = {"assessment": "not_applicable"}
         elif not self.can_run(context):
             status, reason_code, reason, coverage = self.not_applicable_result(context)
         else:
@@ -110,11 +117,11 @@ class Scanner(ABC):
                 raw = {"_runner": {"message": "Scanner could not be executed"}}
 
         safe_raw = sanitize_data(raw)
-        if not coverage and parsed_successfully:
+        if parsed_successfully:
             try:
-                coverage = self.coverage_from_output(safe_raw, context)
+                coverage.update(self.coverage_from_output(safe_raw, context))
             except Exception:
-                coverage = {"assessment": "unknown"}
+                coverage["assessment"] = "unknown"
         elif not coverage:
             coverage = {
                 "assessment": "not_applicable" if status in {"skipped", "not_applicable"} else "unknown",
@@ -141,6 +148,7 @@ class Scanner(ABC):
             error = f"{error} (exit code {process_returncode})"
         if status == "failed" and 'stderr' in locals() and stderr:
             error = f"{error}: {_safe_text(stderr[-500:]).strip()}"
+        coverage = self.finalize_coverage(coverage, status)
         finished = datetime.now(timezone.utc)
         duration = int((time.monotonic() - started_clock) * 1000)
         result = ScannerResult(
@@ -183,13 +191,29 @@ class TrivyScanner(Scanner):
 
     def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
         results = raw.get("Results")
+        requested = {
+            "dependency": True,
+            "secret": True,
+            "container": True,
+            "iac": True,
+        }
         coverage: dict[str, Any] = {
             "assessment": "unknown",
             "filesDiscovered": context.project.file_count,
             "candidateArtifacts": context.project.artifacts,
+            "capabilities": {
+                capability: {
+                    "assessment": "unknown",
+                    "requested": requested[capability],
+                    "resultEntries": None,
+                }
+                for capability in requested
+            },
         }
         if isinstance(results, list):
-            coverage["targetsWithResults"] = len(results)
+            coverage["resultEntryCount"] = len(results)
+            for capability in coverage["capabilities"].values():
+                capability["resultEntries"] = len(results)
         return coverage
 
     def validate_schema(self, raw: dict[str, Any]) -> str:
@@ -226,49 +250,88 @@ class OsvScanner(Scanner):
     def can_run(self, context: ScannerContext) -> bool:
         return bool(context.project.lockfiles)
 
+    def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
+        targets = list(context.project.lockfiles)
+        unsupported_count = len(context.project.unsupported_dependency_manifests) + len(context.project.unsupported_dependency_projects)
+        return {
+            "assessment": "unknown",
+            "targetCounts": {
+                "attempted": len(targets), "completed": 0, "failed": 0,
+                "unsupported": unsupported_count,
+            },
+            "targets": [{"path": path, "state": "attempted", "findingCount": None} for path in targets],
+        }
+
+    def finalize_coverage(self, coverage: dict[str, Any], status: str) -> dict[str, Any]:
+        targets = coverage.get("targets")
+        if not isinstance(targets, list):
+            return coverage
+        completed = status in {"clean", "completed_with_findings"}
+        state = "completed" if completed else "failed" if status in {"failed", "timeout"} else "not_applicable"
+        for target in targets:
+            target["state"] = state
+        counts = coverage.setdefault("targetCounts", {})
+        counts["completed"] = len(targets) if completed else 0
+        counts["failed"] = len(targets) if state == "failed" else 0
+        coverage["assessment"] = "partial" if counts.get("unsupported", 0) else "complete" if completed else "unknown"
+        return coverage
+
     def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
-        candidates = context.project.dependency_manifests
-        supported = context.project.lockfiles
-        unsupported = context.project.unsupported_dependency_manifests
-        if unsupported:
+        unsupported_manifests = context.project.unsupported_dependency_manifests
+        unsupported_projects = context.project.unsupported_dependency_projects
+        unsupported_count = len(unsupported_manifests) + len(unsupported_projects)
+        if unsupported_count:
             return (
                 "unsupported_manifest",
-                "unsupported_dependency_manifest",
-                "OSV-Scanner 2.3.3 supports specific lockfiles (including packages.lock.json, packages.config, "
-                "and .deps.json), but cannot process detected manifest(s): " + ", ".join(unsupported),
+                "unsupported_dependency_input",
+                f"OSV-Scanner 2.3.3 cannot directly analyze {unsupported_count} detected dependency project/manifest(s); "
+                "see project.json for the inventory.",
                 {
                     "assessment": "limited",
-                    "candidateArtifacts": candidates,
-                    "supportedArtifacts": supported,
-                    "coveredArtifacts": context.project.covered_dependency_manifests,
-                    "unsupportedArtifacts": unsupported,
+                    "unsupportedManifestCount": len(unsupported_manifests),
+                    "unsupportedProjectCount": len(unsupported_projects),
+                    "targetCounts": {"attempted": 0, "completed": 0, "failed": 0, "unsupported": unsupported_count},
                 },
             )
         return (
             "not_applicable",
             "no_dependency_manifest",
-            "No dependency manifest was detected. Project technologies: "
-            f"{', '.join(context.project.technologies) or 'none'}; inventory artifacts: "
-            f"{', '.join(context.project.artifacts) or 'none'}. OSV-Scanner requires a supported lockfile or pinned manifest.",
+            f"No dependency manifest candidate was detected among {len(context.project.artifacts)} project artifacts. "
+            f"Detected technologies: {', '.join(context.project.technologies) or 'none'}. OSV-Scanner requires a supported lockfile or pinned manifest.",
             {
                 "assessment": "not_applicable",
-                "candidateArtifacts": candidates,
-                "detectedArtifacts": context.project.artifacts,
-                "supportedArtifacts": [],
-                "coveredArtifacts": context.project.covered_dependency_manifests,
+                "targetCounts": {"attempted": 0, "completed": 0, "failed": 0, "unsupported": 0},
+                "candidateManifestCount": 0,
             },
         )
 
     def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
-        unsupported = context.project.unsupported_dependency_manifests
+        unsupported_manifests = context.project.unsupported_dependency_manifests
+        unsupported_projects = context.project.unsupported_dependency_projects
         results = raw.get("results")
+        findings_by_target: dict[str, int] = {}
+        for result in results if isinstance(results, list) else []:
+            source = result.get("source") if isinstance(result, dict) else None
+            source_path = _workspace_relative(source.get("path")) if isinstance(source, dict) else ""
+            package_results = result.get("packages") or [] if isinstance(result, dict) else []
+            finding_count = sum(
+                len(package_result.get("vulnerabilities") or [])
+                for package_result in package_results
+                if isinstance(package_result, dict)
+            )
+            if source_path:
+                findings_by_target[source_path] = findings_by_target.get(source_path, 0) + finding_count
+        targets = [
+            {"path": path, "state": "attempted", "findingCount": findings_by_target.get(path, 0)}
+            for path in context.project.lockfiles
+        ]
         return {
-            "assessment": "partial" if unsupported else "complete",
-            "candidateArtifacts": context.project.dependency_manifests,
-            "supportedArtifacts": context.project.lockfiles,
-            "coveredArtifacts": context.project.covered_dependency_manifests,
-            "unsupportedArtifacts": unsupported,
-            "resultSources": len(results) if isinstance(results, list) else None,
+            "assessment": "unknown",
+            "unsupportedManifestCount": len(unsupported_manifests),
+            "unsupportedProjectCount": len(unsupported_projects),
+            "unsupportedInputCount": len(unsupported_manifests) + len(unsupported_projects),
+            "targets": targets,
+            "resultSourcesWithFindings": len(findings_by_target),
         }
 
     def validate_schema(self, raw: dict[str, Any]) -> str | None:
@@ -290,7 +353,10 @@ class OsvScanner(Scanner):
         return None
 
     def command(self, context: ScannerContext) -> list[str]:
-        return ["osv-scanner", "scan", "source", "--recursive", "--format", "json", str(context.workspace)]
+        command = ["osv-scanner", "scan", "source", "--format", "json"]
+        for target in context.project.lockfiles:
+            command.extend(["--lockfile", str(context.workspace / target)])
+        return command
 
 
 class SastScanner(Scanner):
@@ -351,7 +417,24 @@ class SastScanner(Scanner):
         source_files = set(context.project.source_files)
         scanned_sources = source_files.intersection(scanned_paths)
         skipped_sources = source_files.intersection(normalized_skipped)
-        parse_errors = sum(1 for error in errors or [] if _is_parse_error(error)) if isinstance(errors, list) else None
+        parse_error_entries = [error for error in errors or [] if _is_parse_error(error)] if isinstance(errors, list) else []
+        parse_error_paths: set[str] = set()
+        parse_error_files = []
+        for error in parse_error_entries:
+            error_paths = error.get("paths") or [error.get("path")]
+            if isinstance(error_paths, str):
+                error_paths = [error_paths]
+            normalized_paths = sorted({_workspace_relative(path) for path in error_paths if path})
+            parse_error_paths.update(normalized_paths)
+            message = error.get("message") or error.get("shortMessage") or error.get("longMessage")
+            for error_path in normalized_paths:
+                parse_error_files.append({
+                    "path": error_path,
+                    "type": _semgrep_error_type(error),
+                    **({"message": _safe_text(str(message))[:300]} if message else {}),
+                })
+        successfully_parsed = scanned_sources - parse_error_paths
+        parse_errors = len(parse_error_entries) if isinstance(errors, list) else None
         observed_errors = len(errors) if isinstance(errors, list) else None
         skipped_count = len(skipped_paths) if isinstance(skipped_paths, list) else None
         rules_skipped = len(skipped_rules) if isinstance(skipped_rules, list) else None
@@ -373,10 +456,12 @@ class SastScanner(Scanner):
         coverage = {
             "assessment": assessment,
             "filesDiscovered": len(context.project.source_files),
-            "filesAnalyzed": len(scanned_sources),
+            "attemptedFiles": len(scanned_sources),
+            "filesAnalyzed": len(successfully_parsed),
+            "parseErrorFiles": sorted(parse_error_files, key=lambda item: (item["path"], item["type"])),
             "pathsReportedScanned": len(scanned) if isinstance(scanned, list) else None,
             "csharpFilesDiscovered": sum(path.casefold().endswith(".cs") for path in context.project.source_files),
-            "csharpFilesAnalyzed": sum(path.casefold().endswith(".cs") for path in scanned_sources),
+            "csharpFilesAnalyzed": sum(path.casefold().endswith(".cs") for path in successfully_parsed),
             "rulesetsConfigured": ["p/security-audit"],
             "rulesLoaded": rules_loaded,
             "rulesSkipped": rules_skipped,
@@ -455,8 +540,15 @@ def sanitize_data(value: Any, secret_context: bool = False) -> Any:
 def _is_parse_error(error: Any) -> bool:
     if not isinstance(error, dict):
         return False
-    error_type = str(error.get("type") or "").casefold()
+    error_type = _semgrep_error_type(error).casefold()
     return "parse" in error_type or "pars" in error_type
+
+
+def _semgrep_error_type(error: dict[str, Any]) -> str:
+    error_type = error.get("type")
+    if isinstance(error_type, list) and error_type:
+        error_type = error_type[0]
+    return error_type[:120] if isinstance(error_type, str) else "unknown"
 
 
 def _workspace_relative(value: Any) -> str:

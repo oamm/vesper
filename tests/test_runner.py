@@ -44,7 +44,7 @@ class DetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name in (
-                "App.csproj", "App.sln", "packages.lock.json", "legacy/packages.config", "publish/app.deps.json", "conan.lock",
+                "App.csproj", "App.sln", "packages.lock.json", "legacy/Legacy.csproj", "legacy/packages.config", "publish/app.deps.json", "conan.lock",
                 "node/package.json", "node/package-lock.json",
                 "tmp/generated.cs", ".tmp/work.cs", "obj/ignored.cs",
             ):
@@ -55,16 +55,28 @@ class DetectionTests(unittest.TestCase):
             project = detect_project(root)
 
             self.assertEqual(project.lockfiles, ["conan.lock", "legacy/packages.config", "node/package-lock.json", "packages.lock.json", "publish/app.deps.json"])
-            self.assertEqual(project.dependency_manifests, ["App.csproj", "conan.lock", "legacy/packages.config", "node/package-lock.json", "node/package.json", "packages.lock.json", "publish/app.deps.json"])
+            self.assertEqual(project.dependency_manifests, ["conan.lock", "legacy/packages.config", "node/package-lock.json", "node/package.json", "packages.lock.json", "publish/app.deps.json"])
             self.assertEqual(project.covered_dependency_manifests, ["node/package.json"])
-            self.assertEqual(project.unsupported_dependency_manifests, ["App.csproj"])
+            self.assertEqual(project.unsupported_dependency_manifests, [])
             self.assertIn("App.sln", project.artifacts)
             self.assertNotIn("App.sln", project.dependency_manifests)
+            self.assertEqual(project.project_descriptors, ["App.csproj", "App.sln", "legacy/Legacy.csproj"])
+            self.assertEqual(project.dotnet_projects, [
+                {
+                    "name": "App", "projectDescriptor": "App.csproj",
+                    "scannerInputs": ["packages.lock.json", "publish/app.deps.json"], "coverage": "supported", "scope": "unknown",
+                },
+                {
+                    "name": "Legacy", "projectDescriptor": "legacy/Legacy.csproj",
+                    "scannerInputs": ["legacy/packages.config"], "coverage": "supported", "scope": "unknown",
+                },
+            ])
+            self.assertEqual(project.unsupported_dependency_projects, [])
             self.assertIn("C/C++", project.technologies)
             self.assertEqual(project.artifact_summary["conanLock"], 1)
             self.assertEqual(project.artifact_summary["packagesLock"], 1)
             self.assertEqual(project.artifact_summary["packagesConfig"], 1)
-            self.assertEqual(project.file_count, 8)
+            self.assertEqual(project.file_count, 9)
             self.assertEqual(project.source_files, [])
             self.assertEqual(
                 {item["path"] for item in project.exclusions},
@@ -162,6 +174,19 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(first["impact"]["type"], "denial_of_service")
         self.assertEqual(first["reachability"], "unknown")
         self.assertEqual(first["remediationPriority"], "p2")
+        self.assertEqual(first["fingerprintVersion"], 2)
+
+    def test_dependency_fingerprint_includes_ecosystem_and_not_detector(self):
+        nuget = normalize("trivy", {"Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+            "VulnerabilityID": "CVE-2024-55555", "PkgName": "Example.Package", "InstalledVersion": "1.2.3",
+            "PkgType": "nuget", "Severity": "HIGH",
+        }]}]})[0]
+        npm = normalize("trivy", {"Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+            "VulnerabilityID": "CVE-2024-55555", "PkgName": "Example.Package", "InstalledVersion": "1.2.3",
+            "PkgType": "npm", "Severity": "HIGH",
+        }]}]})[0]
+        self.assertNotEqual(nuget["fingerprint"], npm["fingerprint"])
+        self.assertEqual(nuget["fingerprintVersion"], 2)
 
     def test_snake_case_credential_is_redacted_from_finding_evidence(self):
         raw = {"results": [{
@@ -201,6 +226,26 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual({entry["scanner"] for entry in merged[0]["scannerEvidence"]}, {"trivy", "osv-scanner"})
         self.assertEqual(merged[0]["package"]["ecosystem"], "nuget")
+        self.assertEqual(merged[0]["detectors"], ["osv-scanner", "trivy"])
+        self.assertEqual(merged[0]["corroboration"], {"detectorCount": 2, "detectors": ["osv-scanner", "trivy"]})
+        self.assertEqual(merged[0]["primaryScanner"]["name"], "osv-scanner")
+        self.assertEqual(merged[0]["scanner"]["name"], "osv-scanner")
+
+    def test_cross_scanner_primary_alias_and_fingerprint_ignore_execution_order(self):
+        trivy = normalize("trivy", {"Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+            "VulnerabilityID": "CVE-2024-77777", "PkgName": "Example.Package", "InstalledVersion": "2.0.0",
+            "PkgType": "nuget", "Severity": "HIGH",
+        }]}]})[0]
+        osv = normalize("osv-scanner", {"results": [{"source": {"path": "/workspace/packages.lock.json"}, "packages": [{
+            "package": {"name": "Example.Package", "version": "2.0.0", "ecosystem": "NuGet"},
+            "vulnerabilities": [{"id": "OSV-777", "aliases": ["CVE-2024-77777"]}],
+        }]}]})[0]
+
+        forward = deduplicate([trivy, osv])[0]
+        reverse = deduplicate([osv, trivy])[0]
+        self.assertEqual(forward["fingerprint"], reverse["fingerprint"])
+        self.assertEqual(forward["primaryScanner"], reverse["primaryScanner"])
+        self.assertEqual(forward["scannerEvidence"], reverse["scannerEvidence"])
 
     def test_severity_aliases(self):
         self.assertEqual(normalize_severity("warning"), "medium")
@@ -266,9 +311,12 @@ class ReportConsistencyTests(unittest.TestCase):
             self.assertEqual(scan["reportSchemas"]["findings"], 2)
             self.assertEqual(scan["scanId"], report["scanId"])
             self.assertEqual(summary["findings"]["total"], len(findings))
-            self.assertEqual(summary["total"], len(findings))
-            self.assertEqual(sum(summary["severity"].values()), len(findings))
-            self.assertEqual(sum(summary["categories"].values()), len(findings))
+            self.assertEqual(sum(summary["findings"]["severity"].values()), len(findings))
+            self.assertEqual(sum(summary["findings"]["categories"].values()), len(findings))
+            self.assertNotIn("total", summary)
+            self.assertNotIn("severity", summary)
+            self.assertNotIn("categories", summary)
+            self.assertNotIn("categorySeverity", summary)
             self.assertEqual(len(remediations), 1)
             self.assertEqual(remediations[0]["findingCount"], len(remediations[0]["affectedFindings"]))
             self.assertEqual(remediations[0]["affectedFindings"], [findings[0]["id"]])
@@ -468,6 +516,7 @@ class ScannerContinuationTests(unittest.TestCase):
             raw_dir = output / "raw"
             raw_dir.mkdir(parents=True)
             context = ScannerContext(root, output, raw_dir, detect_project(root), 5)
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
             native_title = "org.bouncycastle:bcprov-jdk18on affected by CVE-2024-30172"
             native_description = "Upstream advisory includes Java package coordinates."
             raw = {
@@ -512,10 +561,11 @@ class ScannerContinuationTests(unittest.TestCase):
             ) as process:
                 result, findings = OsvScanner().execute(context)
                 self.assertEqual(result.status, "unsupported_manifest")
-                self.assertEqual(result.reason_code, "unsupported_dependency_manifest")
-                self.assertEqual(result.coverage["candidateArtifacts"], ["App.csproj"])
-                self.assertEqual(result.coverage["supportedArtifacts"], [])
-                self.assertEqual(result.coverage["unsupportedArtifacts"], ["App.csproj"])
+                self.assertEqual(result.reason_code, "unsupported_dependency_input")
+                self.assertEqual(result.coverage["unsupportedManifestCount"], 0)
+                self.assertEqual(result.coverage["unsupportedProjectCount"], 1)
+                self.assertEqual(project.unsupported_dependency_projects, ["App.csproj"])
+                self.assertEqual(result.coverage["targetCounts"]["attempted"], 0)
                 process.assert_not_called()
 
             code, report = run_scan(root, Path(temporary) / "scan-output", config, [OsvScanner()])
@@ -524,7 +574,10 @@ class ScannerContinuationTests(unittest.TestCase):
             self.assertEqual(report["securityGate"]["status"], "indeterminate")
             summary = json.loads((Path(temporary) / "scan-output" / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["coverage"]["scanners"]["osv-scanner"]["status"], "unsupported_manifest")
-            self.assertEqual(summary["coverage"]["warnings"][0]["code"], "unsupported_dependency_manifest")
+            self.assertEqual(summary["coverage"]["warnings"][0]["code"], "unsupported_dependency_input")
+            self.assertEqual(summary["coverage"]["warnings"][0]["detailsLocation"], "project.json")
+            self.assertEqual(summary["coverage"]["warnings"][0]["artifactCount"], 1)
+            self.assertNotIn("App.csproj", json.dumps(summary))
 
     def test_osv_runs_for_supported_nuget_lockfiles(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -540,9 +593,76 @@ class ScannerContinuationTests(unittest.TestCase):
                 result, findings = OsvScanner().execute(context)
             process.assert_called_once()
             self.assertEqual(result.status, "clean")
-            self.assertEqual(result.coverage["assessment"], "partial")
-            self.assertEqual(result.coverage["supportedArtifacts"], ["packages.lock.json"])
-            self.assertEqual(result.coverage["unsupportedArtifacts"], ["App.csproj"])
+            self.assertEqual(result.coverage["assessment"], "complete")
+            self.assertEqual(result.coverage["targetCounts"], {"attempted": 1, "completed": 1, "failed": 0, "unsupported": 0})
+            self.assertEqual(result.coverage["targets"], [{"path": "packages.lock.json", "state": "completed", "findingCount": 0}])
+            self.assertEqual(project.dotnet_projects[0]["scannerInputs"], ["packages.lock.json"])
+            self.assertEqual(findings, [])
+
+    def test_osv_explicit_targets_record_clean_and_vulnerable_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            first_lock = root / "ServiceA" / "packages.lock.json"
+            second_lock = root / "ServiceB" / "packages.config"
+            first_lock.parent.mkdir(parents=True)
+            second_lock.parent.mkdir(parents=True)
+            first_lock.write_text("{}", encoding="utf-8")
+            second_lock.write_text("{}", encoding="utf-8")
+            output = Path(temporary) / "out"
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            raw_dir = output / "raw"
+            raw_dir.mkdir(parents=True)
+            context = ScannerContext(root, output, raw_dir, detect_project(root), 5)
+            raw = {"results": [{
+                "source": {"path": "/workspace/ServiceB/packages.config"},
+                "packages": [{
+                    "package": {"name": "Example.Package", "version": "1.0.0", "ecosystem": "NuGet"},
+                    "vulnerabilities": [{"id": "OSV-123", "aliases": ["CVE-2024-12345"]}],
+                }],
+            }]}
+            with patch("security_runner.scanners.Scanner._version", return_value="osv-scanner version: 2.3.3"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps(raw), "", 0)
+            ) as process:
+                code, report = run_scan(root, output, config, [OsvScanner()])
+
+            command = process.call_args.args[0]
+            targets = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--lockfile"]
+            self.assertEqual(targets, [str(first_lock), str(second_lock)])
+            self.assertNotIn("--recursive", command)
+            self.assertEqual(code, 0)
+            result = report["scanners"][0]
+            self.assertEqual(result["status"], "completed_with_findings")
+            self.assertEqual(result["coverage"]["targetCounts"], {"attempted": 2, "completed": 2, "failed": 0, "unsupported": 0})
+            target_status = {target["path"]: target for target in result["coverage"]["targets"]}
+            self.assertEqual(target_status["ServiceA/packages.lock.json"]["state"], "completed")
+            self.assertEqual(target_status["ServiceA/packages.lock.json"]["findingCount"], 0)
+            self.assertEqual(target_status["ServiceB/packages.config"]["state"], "completed")
+            self.assertEqual(target_status["ServiceB/packages.config"]["findingCount"], 1)
+            self.assertEqual(report["securityGate"]["status"], "passed")
+            persisted_scan = json.loads((output / "scan.json").read_text(encoding="utf-8"))
+            summary_text = (output / "summary.json").read_text(encoding="utf-8")
+            self.assertEqual(persisted_scan["scanners"][0]["coverage"]["targets"], result["coverage"]["targets"])
+            self.assertEqual(persisted_scan["scanners"][0]["coverage"]["targetCounts"]["completed"], 2)
+            self.assertNotIn("ServiceA/packages.lock.json", summary_text)
+            self.assertEqual(json.loads((output / "findings.json").read_text(encoding="utf-8"))[0]["scannerEvidence"][0]["nativeId"], "OSV-123")
+
+    def test_osv_failed_invocation_marks_explicit_targets_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            lockfile = root / "packages.lock.json"
+            lockfile.write_text("{}", encoding="utf-8")
+            output = Path(temporary) / "out"
+            raw_dir = output / "raw"
+            raw_dir.mkdir(parents=True)
+            context = ScannerContext(root, output, raw_dir, detect_project(root), 5)
+            with patch("security_runner.scanners.Scanner._version", return_value="osv-scanner version: 2.3.3"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps({"results": []}), "network failure", 2)
+            ):
+                result, findings = OsvScanner().execute(context)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.coverage["targetCounts"], {"attempted": 1, "completed": 0, "failed": 1, "unsupported": 0})
+            self.assertEqual(result.coverage["targets"], [{"path": "packages.lock.json", "state": "failed", "findingCount": 0}])
             self.assertEqual(findings, [])
 
     def test_semgrep_clean_status_exposes_partial_coverage_facts(self):
@@ -555,7 +675,7 @@ class ScannerContinuationTests(unittest.TestCase):
             raw_output = {
                 "version": "1.99.0",
                 "results": [],
-                "errors": [{"type": "PartialParsing", "code": 3, "path": "App.cs"}],
+                "errors": [{"type": ["PartialParsing", [{"path": "App.cs"}]], "code": 3, "path": "App.cs"}],
                 "paths": {"scanned": ["/workspace/App.cs"]},
                 "skipped_rules": [],
             }
@@ -569,13 +689,13 @@ class ScannerContinuationTests(unittest.TestCase):
             coverage = report["scanners"][0]["coverage"]
             self.assertEqual(coverage["assessment"], "partial")
             self.assertEqual(coverage["filesDiscovered"], 2)
-            self.assertEqual(coverage["filesAnalyzed"], 1)
-            self.assertEqual(coverage["filesDiscovered"], 2)
-            self.assertEqual(coverage["filesAnalyzed"], 1)
+            self.assertEqual(coverage["attemptedFiles"], 1)
+            self.assertEqual(coverage["filesAnalyzed"], 0)
             self.assertNotIn("filesSkipped", coverage)
             self.assertEqual(coverage["pathsReportedScanned"], 1)
-            self.assertEqual(coverage["csharpFilesAnalyzed"], 1)
+            self.assertEqual(coverage["csharpFilesAnalyzed"], 0)
             self.assertEqual(coverage["parseErrors"], 1)
+            self.assertEqual(coverage["parseErrorFiles"], [{"path": "App.cs", "type": "PartialParsing"}])
             self.assertIsNone(coverage["rulesLoaded"])
             self.assertEqual(coverage["rulesetsConfigured"], ["p/security-audit"])
             self.assertEqual(report["securityGate"]["status"], "passed")
@@ -689,6 +809,10 @@ class ScannerContinuationTests(unittest.TestCase):
                 self.assertEqual(result.status, "clean")
                 self.assertEqual(findings, [])
                 self.assertEqual(result.schema_version, {"trivy": "2", "osv-scanner": None, "semgrep": "1.99.0"}[scanner.name])
+                if scanner.name == "trivy":
+                    for capability in ("dependency", "secret", "container", "iac"):
+                        self.assertEqual(result.coverage["capabilities"][capability]["assessment"], "unknown")
+                        self.assertTrue(result.coverage["capabilities"][capability]["requested"])
 
             with patch("security_runner.scanners.Scanner._version", return_value="test"), patch(
                 "security_runner.scanners._run_process",
