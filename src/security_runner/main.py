@@ -8,6 +8,7 @@ from security_runner.runner import (
     EXIT_INTERNAL_ERROR,
     EXIT_RUNNER_FAILED,
     ConfigurationError,
+    ReportConsistencyError,
     load_config,
     run_scan,
 )
@@ -30,6 +31,9 @@ def main() -> int:
     try:
         exit_code, _ = run_scan(args.workspace, args.output, config)
         return exit_code
+    except ReportConsistencyError as exc:
+        print(f"[report] {exc}", file=sys.stderr)
+        return EXIT_RUNNER_FAILED
     except RuntimeError as exc:
         print(f"[runner] {exc}", file=sys.stderr)
         return EXIT_RUNNER_FAILED

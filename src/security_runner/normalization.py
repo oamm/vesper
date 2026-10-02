@@ -141,7 +141,7 @@ def _normalize_semgrep(raw: Any) -> list[dict[str, Any]]:
 def _finding(category: str, finding_type: Any, title: Any, description: Any, severity: Any,
              scanner: str, rule_id: Any, path: Any, line: Any, column: Any, cwe: Any,
              cve: Any, cvss: Any, package: Any, evidence: Any, raw_id: Any,
-             confidence: Any = "high") -> dict[str, Any]:
+             confidence: Any = "unknown") -> dict[str, Any]:
     normalized_severity = normalize_severity(severity)
     type_value = _safe_text(finding_type or category)
     cwe_list = cwe if isinstance(cwe, list) else [cwe] if cwe else []
@@ -155,26 +155,74 @@ def _finding(category: str, finding_type: Any, title: Any, description: Any, sev
     fingerprint = hashlib.sha256("|".join(components).encode("utf-8")).hexdigest()
     cwe_out = sorted({_safe_text(value) for value in cwe_list if value})
     cve_out = sorted({_safe_text(value) for value in cve_list if value})
+    native_title = _safe_text(title or "")
+    native_description = _safe_text(description or "")
+    native_id = _safe_text(raw_id or "")
+    identifiers = sorted({_safe_text(str(value)) for value in [raw_id, *cve_list] if value})
+    if category == "dependency" and package_value:
+        package_label = str(package_value["name"])
+        if package_value.get("version"):
+            package_label += f" {package_value['version']}"
+        vulnerability_id = cve_out[0] if cve_out else native_id
+        title_out = f"{package_label} affected by {vulnerability_id}" if vulnerability_id else f"{package_label} vulnerability"
+        ecosystem = package_value.get("ecosystem") or "unknown ecosystem"
+        description_out = f"Detected {ecosystem} package {package_label} in {location_file or 'an unspecified repository path'}."
+    else:
+        title_out = native_title or type_value
+        description_out = native_description
+    finding_nature, context_required, context_reason = _finding_nature(category, rule_id, native_title, native_description)
+    detection_confidence = _safe_text(confidence or "unknown").casefold()
+    impact = {"type": _impact_type(category, cwe_out, title, description)}
     return {
+        "schemaVersion": 2,
         "id": f"finding-{fingerprint[:20]}",
         "fingerprint": fingerprint,
         "category": category,
+        "findingNature": finding_nature,
         "type": type_value,
         "severity": normalized_severity,
         "remediationPriority": {"critical": "p0", "high": "p1", "medium": "p2", "low": "p3", "info": "p4", "unknown": "p4"}[normalized_severity],
-        "confidence": _safe_text(confidence or "unknown").lower(),
-        "title": _safe_text(title or type_value),
-        "description": _safe_text(description or ""),
+        "detectionConfidence": detection_confidence,
+        "confidence": detection_confidence,
+        "reachability": "unknown",
+        "applicability": "unknown",
+        "contextRequired": context_required,
+        "title": _safe_text(title_out),
+        "description": description_out,
         "scanner": {"name": scanner, "ruleId": _safe_text(rule_id or "")},
         "location": {"file": location_file, "line": line, "column": column},
-        "security": {"cwe": cwe_out, "cve": cve_out, "cvss": cvss},
+        "security": {"cwe": cwe_out, "cve": cve_out, "identifiers": identifiers, "cvss": cvss},
         "package": package_value,
-        "impact": {"type": _impact_type(category, cwe_out, title, description), "summary": None},
-        "reachability": "unknown",
-        "evidence": {"message": _safe_text(evidence or ""), "snippet": None},
-        "scannerEvidence": [{"scanner": scanner, "rawId": _safe_text(raw_id or "")}],
+        "impact": impact,
+        "evidence": {"message": _safe_text(evidence or "")},
+        "scannerEvidence": [{
+            "scanner": scanner,
+            "rawId": native_id,
+            "nativeId": native_id,
+            "nativeTitle": native_title,
+            "nativeDescription": native_description,
+        }],
         "scannerMetadata": {"nativeSeverity": _safe_text(severity or "unknown")},
+        **({"contextReason": context_reason} if context_reason else {}),
     }
+
+
+def _finding_nature(category: str, rule_id: Any, title: str, description: str) -> tuple[str, bool, str | None]:
+    rule = str(rule_id or "").casefold()
+    text = f"{title} {description}".casefold()
+    if category == "dependency":
+        return "dependency_vulnerability", False, None
+    if category == "secret":
+        return "secret", False, None
+    if category == "sast":
+        return "vulnerability", False, None
+    if category == "iac":
+        return "iac", False, None
+    if category == "container" and ("ds026" in rule or "healthcheck" in text or "health check" in text):
+        return "hardening", True, "Container health may be managed by deployment-orchestrator probes."
+    if category == "container":
+        return "misconfiguration", False, None
+    return "unknown", False, None
 
 
 def deduplicate(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -188,12 +236,26 @@ def deduplicate(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         evidence = {(item["scanner"], item["rawId"]): item for item in existing["scannerEvidence"]}
         for item in finding["scannerEvidence"]:
             evidence[(item["scanner"], item["rawId"])] = item
-        existing["scannerEvidence"] = list(evidence.values())
+        existing["scannerEvidence"] = sorted(evidence.values(), key=lambda item: (item["scanner"], item["rawId"]))
         if SEVERITY_WEIGHT[finding["severity"]] > SEVERITY_WEIGHT[existing["severity"]]:
             existing["severity"] = finding["severity"]
+            existing["remediationPriority"] = {
+                "critical": "p0", "high": "p1", "medium": "p2", "low": "p3", "info": "p4", "unknown": "p4",
+            }[finding["severity"]]
         for key in ("cwe", "cve"):
             existing["security"][key] = sorted(set(existing["security"][key] + finding["security"][key]))
-    return sorted(merged.values(), key=lambda item: (item["category"], item["location"]["file"], item["fingerprint"]))
+        existing["security"]["identifiers"] = sorted(set(existing["security"]["identifiers"] + finding["security"]["identifiers"]))
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            -SEVERITY_WEIGHT[item["severity"]],
+            item["category"],
+            str((item.get("package") or {}).get("name") or item.get("scanner", {}).get("ruleId") or "").casefold(),
+            str(item.get("location", {}).get("file") or "").casefold(),
+            ",".join((item.get("security") or {}).get("identifiers") or (item.get("security") or {}).get("cve", [])),
+            item["fingerprint"],
+        ),
+    )
 
 
 def _line(item: dict[str, Any], key: str) -> int | None:

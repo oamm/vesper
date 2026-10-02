@@ -36,6 +36,21 @@ class Scanner(ABC):
     def validate_schema(self, raw: dict[str, Any]) -> str | None:
         raise ValueError("scanner has no supported output schema validator")
 
+    def not_applicable_result(
+        self, context: ScannerContext
+    ) -> tuple[str, str, str, dict[str, Any]]:
+        return (
+            "not_applicable",
+            "prerequisite_not_detected",
+            f"{self.name} prerequisites were not detected; project technologies: "
+            f"{', '.join(context.project.technologies) or 'none'}; detected artifacts: "
+            f"{', '.join(context.project.artifacts) or 'none'}.",
+            {"assessment": "not_applicable", "candidateArtifacts": context.project.artifacts},
+        )
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        return {"assessment": "unknown"}
+
     def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
         output_name = self.output_name or self.name
         raw_path = context.raw_dir / f"{output_name}.json"
@@ -46,6 +61,8 @@ class Scanner(ABC):
         status = "completed"
         error = None
         reason = None
+        reason_code = None
+        coverage: dict[str, Any] = {}
         raw: Any = {}
         version = self._version()
         process_returncode: int | None = None
@@ -54,10 +71,10 @@ class Scanner(ABC):
 
         if not self.enabled:
             status = "skipped"
+            reason_code = "disabled_by_configuration"
             reason = "disabled by configuration"
         elif not self.can_run(context):
-            status = "not_applicable"
-            reason = "not applicable to detected project"
+            status, reason_code, reason, coverage = self.not_applicable_result(context)
         else:
             try:
                 output, stderr, process_returncode = _run_process(
@@ -93,6 +110,15 @@ class Scanner(ABC):
                 raw = {"_runner": {"message": "Scanner could not be executed"}}
 
         safe_raw = sanitize_data(raw)
+        if not coverage and parsed_successfully:
+            try:
+                coverage = self.coverage_from_output(safe_raw, context)
+            except Exception:
+                coverage = {"assessment": "unknown"}
+        elif not coverage:
+            coverage = {
+                "assessment": "not_applicable" if status in {"skipped", "not_applicable"} else "unknown",
+            }
         raw_path.write_text(json.dumps(safe_raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         findings: list[dict[str, Any]] = []
         if parsed_successfully:
@@ -120,12 +146,12 @@ class Scanner(ABC):
         result = ScannerResult(
             name=self.name, version=version, status=status, started_at=started.isoformat(),
             finished_at=finished.isoformat(), duration_ms=duration, raw_output=raw_relative, error=error,
-            reason=reason, finding_count=len(findings),
+            reason=reason, reason_code=reason_code, coverage=coverage, finding_count=len(findings),
             schema_version=schema_version,
         )
         if status in {"clean", "completed_with_findings"}:
             print(f"[{self.name}] Completed in {duration / 1000:.1f}s", flush=True)
-        elif status in {"skipped", "not_applicable"}:
+        elif status in {"skipped", "not_applicable", "unsupported_manifest"}:
             print(f"[{self.name}] {status.replace('_', ' ').title()} ({reason})", flush=True)
         else:
             print(f"[{self.name}] {status}: {error}", flush=True)
@@ -146,6 +172,25 @@ class TrivyScanner(Scanner):
 
     def can_run(self, context: ScannerContext) -> bool:
         return context.project.has_files
+
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        return (
+            "not_applicable",
+            "empty_workspace",
+            "Trivy requires repository files; project inventory found 0 files and no artifacts.",
+            {"assessment": "not_applicable", "filesDiscovered": 0, "candidateArtifacts": []},
+        )
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        results = raw.get("Results")
+        coverage: dict[str, Any] = {
+            "assessment": "unknown",
+            "filesDiscovered": context.project.file_count,
+            "candidateArtifacts": context.project.artifacts,
+        }
+        if isinstance(results, list):
+            coverage["targetsWithResults"] = len(results)
+        return coverage
 
     def validate_schema(self, raw: dict[str, Any]) -> str:
         results = raw.get("Results")
@@ -181,6 +226,51 @@ class OsvScanner(Scanner):
     def can_run(self, context: ScannerContext) -> bool:
         return bool(context.project.lockfiles)
 
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        candidates = context.project.dependency_manifests
+        supported = context.project.lockfiles
+        unsupported = context.project.unsupported_dependency_manifests
+        if unsupported:
+            return (
+                "unsupported_manifest",
+                "unsupported_dependency_manifest",
+                "OSV-Scanner 2.3.3 supports specific lockfiles (including packages.lock.json, packages.config, "
+                "and .deps.json), but cannot process detected manifest(s): " + ", ".join(unsupported),
+                {
+                    "assessment": "limited",
+                    "candidateArtifacts": candidates,
+                    "supportedArtifacts": supported,
+                    "coveredArtifacts": context.project.covered_dependency_manifests,
+                    "unsupportedArtifacts": unsupported,
+                },
+            )
+        return (
+            "not_applicable",
+            "no_dependency_manifest",
+            "No dependency manifest was detected. Project technologies: "
+            f"{', '.join(context.project.technologies) or 'none'}; inventory artifacts: "
+            f"{', '.join(context.project.artifacts) or 'none'}. OSV-Scanner requires a supported lockfile or pinned manifest.",
+            {
+                "assessment": "not_applicable",
+                "candidateArtifacts": candidates,
+                "detectedArtifacts": context.project.artifacts,
+                "supportedArtifacts": [],
+                "coveredArtifacts": context.project.covered_dependency_manifests,
+            },
+        )
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        unsupported = context.project.unsupported_dependency_manifests
+        results = raw.get("results")
+        return {
+            "assessment": "partial" if unsupported else "complete",
+            "candidateArtifacts": context.project.dependency_manifests,
+            "supportedArtifacts": context.project.lockfiles,
+            "coveredArtifacts": context.project.covered_dependency_manifests,
+            "unsupportedArtifacts": unsupported,
+            "resultSources": len(results) if isinstance(results, list) else None,
+        }
+
     def validate_schema(self, raw: dict[str, Any]) -> str | None:
         results = raw.get("results")
         if not isinstance(results, list):
@@ -210,6 +300,26 @@ class SastScanner(Scanner):
     def can_run(self, context: ScannerContext) -> bool:
         return context.project.has_source
 
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        return (
+            "not_applicable",
+            "no_supported_source_files",
+            "Semgrep requires supported source files; project technologies: "
+            f"{', '.join(context.project.technologies) or 'none'}; detected source-file count: 0; "
+            f"inventory artifacts: {', '.join(context.project.artifacts) or 'none'}.",
+            {
+                "assessment": "not_applicable",
+                "filesDiscovered": 0,
+                "filesAnalyzed": 0,
+                "rulesetsConfigured": ["p/security-audit"],
+                "rulesLoaded": None,
+                "parseErrors": 0,
+                "candidateArtifacts": context.project.artifacts,
+                "candidateFiles": context.project.source_files,
+                "supportedArtifacts": [],
+            },
+        )
+
     def validate_schema(self, raw: dict[str, Any]) -> str:
         if not isinstance(raw.get("version"), str) or not raw["version"]:
             raise ValueError("scanner output schema is unsupported (expected Semgrep version string)")
@@ -218,6 +328,74 @@ class SastScanner(Scanner):
         if any(not isinstance(result, dict) for result in raw["results"]):
             raise ValueError("scanner output schema is unsupported (Semgrep results entries must be objects)")
         return raw["version"]
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        paths = raw.get("paths")
+        errors = raw.get("errors")
+        skipped_rules = raw.get("skipped_rules")
+        scanned = paths.get("scanned") if isinstance(paths, dict) else None
+        skipped = paths.get("skipped") if isinstance(paths, dict) else None
+        stats = raw.get("stats")
+        rules_loaded = stats.get("rulesLoaded") if isinstance(stats, dict) else None
+        if not isinstance(rules_loaded, int) or isinstance(rules_loaded, bool):
+            rules_loaded = None
+        if isinstance(skipped, dict):
+            skipped_paths = skipped.get("paths")
+        else:
+            skipped_paths = skipped
+        scanned_paths = [_workspace_relative(path) for path in scanned] if isinstance(scanned, list) else []
+        normalized_skipped = [
+            _workspace_relative(item.get("path") if isinstance(item, dict) else item)
+            for item in skipped_paths
+        ] if isinstance(skipped_paths, list) else []
+        source_files = set(context.project.source_files)
+        scanned_sources = source_files.intersection(scanned_paths)
+        skipped_sources = source_files.intersection(normalized_skipped)
+        parse_errors = sum(1 for error in errors or [] if _is_parse_error(error)) if isinstance(errors, list) else None
+        observed_errors = len(errors) if isinstance(errors, list) else None
+        skipped_count = len(skipped_paths) if isinstance(skipped_paths, list) else None
+        rules_skipped = len(skipped_rules) if isinstance(skipped_rules, list) else None
+        if not isinstance(scanned, list) or observed_errors is None or rules_skipped is None:
+            assessment = "unknown"
+        elif observed_errors or rules_skipped or (skipped_count or 0) > 0:
+            assessment = "partial"
+        elif not isinstance(skipped_paths, list):
+            assessment = "unknown"
+        elif not scanned:
+            assessment = "limited"
+        elif rules_loaded is None:
+            assessment = "unknown"
+        elif rules_loaded == 0:
+            assessment = "limited"
+        else:
+            assessment = "complete"
+
+        coverage = {
+            "assessment": assessment,
+            "filesDiscovered": len(context.project.source_files),
+            "filesAnalyzed": len(scanned_sources),
+            "pathsReportedScanned": len(scanned) if isinstance(scanned, list) else None,
+            "csharpFilesDiscovered": sum(path.casefold().endswith(".cs") for path in context.project.source_files),
+            "csharpFilesAnalyzed": sum(path.casefold().endswith(".cs") for path in scanned_sources),
+            "rulesetsConfigured": ["p/security-audit"],
+            "rulesLoaded": rules_loaded,
+            "rulesSkipped": rules_skipped,
+            "parseErrors": parse_errors,
+            "ruleLoadStatus": "no_reported_rule_errors" if observed_errors == 0 else "unknown",
+        }
+        if skipped_count is not None:
+            coverage["filesSkipped"] = len(skipped_sources)
+            coverage["pathsReportedSkipped"] = skipped_count
+            coverage["skippedFiles"] = [
+                {
+                    "path": _safe_text(_workspace_relative(item.get("path"))) if isinstance(item, dict) else _safe_text(_workspace_relative(item)),
+                    **({"reason": _safe_text(str(item["reason"]))} if isinstance(item, dict) and item.get("reason") else {}),
+                }
+                for item in skipped_paths
+            ]
+        if observed_errors is not None:
+            coverage["errors"] = observed_errors
+        return coverage
 
     def command(self, context: ScannerContext) -> list[str]:
         command = [
@@ -272,6 +450,22 @@ def sanitize_data(value: Any, secret_context: bool = False) -> Any:
     if isinstance(value, str):
         return _safe_text(value)
     return value
+
+
+def _is_parse_error(error: Any) -> bool:
+    if not isinstance(error, dict):
+        return False
+    error_type = str(error.get("type") or "").casefold()
+    return "parse" in error_type or "pars" in error_type
+
+
+def _workspace_relative(value: Any) -> str:
+    path = str(value or "").replace("\\", "/")
+    if path.startswith("/workspace/"):
+        return path[len("/workspace/"):]
+    while path.startswith("./"):
+        path = path[2:]
+    return path
 
 
 def _safe_text(value: str) -> str:

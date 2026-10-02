@@ -74,6 +74,7 @@ $exitB = [int](@(Receive-Job $scanB)[-1])
 Remove-Job $scanA, $scanB
 
 try {
+    $scenario = if ($workspacePath -eq $workspacePathB) { 'same-project' } else { 'different-project' }
     Assert-True ($observedRunnerLabels.Count -ge 2) 'Expected two simultaneously active runner containers.'
     $activeIds = @($observedRunnerLabels | ForEach-Object { $_.'securityscan.scan-id' } | Where-Object { $_ })
     Assert-True ($activeIds.Count -ge 2 -and (@($activeIds | Select-Object -Unique).Count -eq $activeIds.Count)) 'Active runners did not have distinct scan IDs.'
@@ -82,10 +83,15 @@ try {
         Assert-True ($resourceLabels -contains 'source' -and $resourceLabels -contains 'output') "Scan $id did not have isolated source/output volumes."
     }
 
-    Assert-True (($exitA -eq 1 -and $exitB -eq 0) -or ($exitA -eq 0 -and $exitB -eq 1)) "Expected independent gate exits 1 and 0, got $exitA and $exitB."
+    if ($scenario -eq 'same-project') {
+        Assert-True (($exitA -eq 1 -and $exitB -eq 0) -or ($exitA -eq 0 -and $exitB -eq 1)) "Expected same-project policy exits 1 and 0, got $exitA and $exitB."
+    }
+    else {
+        Assert-True (($exitA -eq 1 -and $exitB -eq 2) -or ($exitA -eq 2 -and $exitB -eq 1)) "Expected vulnerable and unsupported-coverage exits 1 and 2, got $exitA and $exitB."
+    }
 
-    $reports = @(Get-ChildItem $outputRoot -Directory)
-    Assert-True ($reports.Count -eq 2) 'Expected two separate scan-ID output directories.'
+    $reports = @(Get-ChildItem -Path $outputRoot -Filter 'scan.json' -File -Recurse | ForEach-Object { $_.Directory })
+    Assert-True ($reports.Count -eq 2) 'Expected two separate date-grouped scan output directories.'
     $reportIds = @()
     $gateStatuses = @()
     foreach ($directory in $reports) {
@@ -93,12 +99,28 @@ try {
         $summary = Get-Content (Join-Path $directory.FullName 'summary.json') -Raw | ConvertFrom-Json
         $reportIds += $scan.scanId
         $gateStatuses += $summary.gate.status
-        Assert-True ($directory.Name -eq $scan.scanId.Replace('-', '')) 'Report directory must be named from its full scan ID.'
+        $startedAt = [DateTimeOffset]::Parse($scan.startedAt).ToUniversalTime()
+        $expectedDate = $startedAt.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $expectedTime = $startedAt.ToString('HH-mm-ss', [Globalization.CultureInfo]::InvariantCulture)
+        $shortId = $scan.scanId.Replace('-', '').Substring(0, 12)
+        Assert-True ($directory.Parent.Name -eq $expectedDate) 'Result date directory must use the UTC scan start date.'
+        Assert-True ($directory.Name -eq "${expectedTime}_$shortId") 'Result directory must use the UTC start time and short scan ID.'
+        Assert-True ($scan.durationMs -ge 0) 'Scan duration must be non-negative.'
+        $launcherLog = $logA
+        if (-not (Select-String -Path $launcherLog -SimpleMatch "Scan ID: $($scan.scanId)" -Quiet)) {
+            $launcherLog = $logB
+        }
+        $launcherStartLine = Get-Content $launcherLog | Where-Object { $_ -like 'Started at (UTC): *' } | Select-Object -First 1
+        $runnerStartLine = Get-Content $launcherLog | Where-Object { $_ -match '^\[runner\] Scan .* started at .*' } | Select-Object -First 1
+        Assert-True ($launcherStartLine -eq "Started at (UTC): $($scan.startedAt)") 'Launcher log timestamp must match scan.json.'
+        Assert-True ($runnerStartLine -eq "[runner] Scan $($scan.scanId) started at $($scan.startedAt)") 'Runner log timestamp must match scan.json.'
+        if ($scenario -eq 'different-project' -and $summary.gate.status -eq 'indeterminate') {
+            Assert-True ($scan.executionStatus -eq 'incomplete') 'Unsupported dependency coverage must not appear as a completed scan.'
+        }
     }
     Assert-True (@($reportIds | Select-Object -Unique).Count -eq 2) 'Reports did not preserve distinct scan IDs.'
     Assert-True (@($gateStatuses | Select-Object -Unique).Count -eq 2) 'The separate test policies should produce independent gate states.'
 
-    $scenario = if ($workspacePath -eq $workspacePathB) { 'same-project' } else { 'different-project' }
     Write-Output "PASS: two concurrent $scenario scans used distinct labeled containers, volumes, scan IDs, and output directories."
     Write-Output "Gate exits: $exitA, $exitB"
     Write-Output "Scan IDs: $($reportIds -join ', ')"

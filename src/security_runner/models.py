@@ -8,11 +8,31 @@ class Project:
     technologies: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
     lockfiles: list[str] = field(default_factory=list)
+    dependency_manifests: list[str] = field(default_factory=list)
+    covered_dependency_manifests: list[str] = field(default_factory=list)
+    unsupported_dependency_manifests: list[str] = field(default_factory=list)
+    source_files: list[str] = field(default_factory=list)
+    artifact_summary: dict[str, int] = field(default_factory=dict)
+    exclusions: list[dict[str, str]] = field(default_factory=list)
+    file_count: int = 0
     has_source: bool = False
     has_files: bool = False
 
     def report(self) -> dict[str, Any]:
-        return {"technologies": self.technologies, "artifacts": self.artifacts}
+        return {
+            "schemaVersion": 2,
+            "technologies": self.technologies,
+            "artifacts": self.artifacts,
+            "artifactSummary": self.artifact_summary,
+            "artifactCount": len(self.artifacts),
+            "fileCount": self.file_count,
+            "sourceFileCount": len(self.source_files),
+            "dependencyManifests": self.dependency_manifests,
+            "supportedDependencyManifests": self.lockfiles,
+            "coveredDependencyManifests": self.covered_dependency_manifests,
+            "unsupportedDependencyManifests": self.unsupported_dependency_manifests,
+            "exclusions": self.exclusions,
+        }
 
 
 @dataclass
@@ -38,6 +58,8 @@ class ScannerResult:
     reason: str | None = None
     finding_count: int = 0
     schema_version: str | None = None
+    reason_code: str | None = None
+    coverage: dict[str, Any] = field(default_factory=dict)
 
     def report(self) -> dict[str, Any]:
         return {
@@ -52,6 +74,8 @@ class ScannerResult:
             "reason": self.reason,
             "findingCount": self.finding_count,
             "schemaVersion": self.schema_version,
+            "reasonCode": self.reason_code,
+            "coverage": self.coverage,
         }
 
 

@@ -127,7 +127,12 @@ set -e
 pid_b=
 [ "$exit_b" -eq 0 ] || { cat "$log_b" >&2; echo "Scan B exit was $exit_b" >&2; exit 1; }
 assert_scan_resources_absent "$scan_b" || { echo "Completed scan B resources remain: $scan_b" >&2; exit 1; }
-report_b="$output_root/$(printf '%s' "$scan_b" | tr -d '-')"
+report_b=$(find "$output_root" -type f -name scan.json | while IFS= read -r scan_json; do
+    if grep -Fq "\"scanId\": \"$scan_b\"" "$scan_json"; then
+        dirname "$scan_json"
+        break
+    fi
+done)
 [ -s "$report_b/scan.json" ] && [ -s "$report_b/summary.json" ] || { echo 'Scan B reports were not exported' >&2; exit 1; }
 grep -q '"status": "passed"' "$report_b/scan.json" || { cat "$log_b" >&2; echo 'Scan B gate was not passed' >&2; exit 1; }
 echo "PASS: cancelled scan $scan_a was isolated; scan $scan_b completed with exit $exit_b and exported reports."

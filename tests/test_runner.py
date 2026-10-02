@@ -11,7 +11,7 @@ from security_runner.models import ScannerContext, ScannerResult
 from security_runner.normalization import deduplicate, normalize, normalize_severity
 from security_runner.policy import evaluate
 from security_runner.remediations import build_remediations
-from security_runner.runner import run_scan
+from security_runner.runner import ReportConsistencyError, _validate_report_consistency, run_scan
 from security_runner.scanners import OsvScanner, SastScanner, TrivyScanner
 
 
@@ -40,6 +40,37 @@ class DetectionTests(unittest.TestCase):
                 (root / name).write_text("{}", encoding="utf-8")
             self.assertEqual(detect_project(root).technologies, [".NET", "Node.js", "Docker", "Terraform"])
 
+    def test_inventory_separates_supported_dotnet_locks_and_ignored_transient_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in (
+                "App.csproj", "App.sln", "packages.lock.json", "legacy/packages.config", "publish/app.deps.json", "conan.lock",
+                "node/package.json", "node/package-lock.json",
+                "tmp/generated.cs", ".tmp/work.cs", "obj/ignored.cs",
+            ):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+
+            project = detect_project(root)
+
+            self.assertEqual(project.lockfiles, ["conan.lock", "legacy/packages.config", "node/package-lock.json", "packages.lock.json", "publish/app.deps.json"])
+            self.assertEqual(project.dependency_manifests, ["App.csproj", "conan.lock", "legacy/packages.config", "node/package-lock.json", "node/package.json", "packages.lock.json", "publish/app.deps.json"])
+            self.assertEqual(project.covered_dependency_manifests, ["node/package.json"])
+            self.assertEqual(project.unsupported_dependency_manifests, ["App.csproj"])
+            self.assertIn("App.sln", project.artifacts)
+            self.assertNotIn("App.sln", project.dependency_manifests)
+            self.assertIn("C/C++", project.technologies)
+            self.assertEqual(project.artifact_summary["conanLock"], 1)
+            self.assertEqual(project.artifact_summary["packagesLock"], 1)
+            self.assertEqual(project.artifact_summary["packagesConfig"], 1)
+            self.assertEqual(project.file_count, 8)
+            self.assertEqual(project.source_files, [])
+            self.assertEqual(
+                {item["path"] for item in project.exclusions},
+                {".tmp", "obj", "tmp"},
+            )
+
     def test_custom_nested_output_is_excluded_from_detection_and_scanners(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -57,6 +88,40 @@ class DetectionTests(unittest.TestCase):
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_dependency_title_uses_detected_package_and_keeps_native_advisory(self):
+        native_title = "org.bouncycastle:bcprov-jdk18on is vulnerable to CVE-2024-30172"
+        native_description = "Upstream advisory references Java coordinates and broad platform details."
+        raw = {"results": [{"source": {"path": "packages.lock.json"}, "packages": [{
+            "package": {"name": "BouncyCastle.Cryptography", "version": "2.2.1", "ecosystem": "NuGet"},
+            "vulnerabilities": [{
+                "id": "OSV-2024-1234", "aliases": ["CVE-2024-30172"],
+                "summary": native_title, "details": native_description,
+            }],
+        }]}]}
+        finding = normalize("osv-scanner", raw)[0]
+
+        self.assertEqual(finding["title"], "BouncyCastle.Cryptography 2.2.1 affected by CVE-2024-30172")
+        self.assertEqual(finding["description"], "Detected nuget package BouncyCastle.Cryptography 2.2.1 in packages.lock.json.")
+        self.assertNotIn(native_description, finding["description"])
+        self.assertEqual(finding["scannerEvidence"][0]["nativeTitle"], native_title)
+        self.assertEqual(finding["scannerEvidence"][0]["nativeDescription"], native_description)
+        self.assertEqual(finding["scannerEvidence"][0]["nativeId"], "OSV-2024-1234")
+        self.assertEqual(finding["package"]["ecosystem"], "nuget")
+        self.assertEqual(raw["results"][0]["packages"][0]["vulnerabilities"][0]["summary"], native_title)
+
+    def test_healthcheck_is_hardening_with_context_not_vulnerability(self):
+        finding = normalize("trivy", {"Results": [{"Target": "Dockerfile", "Type": "dockerfile", "Misconfigurations": [{
+            "ID": "DS026", "Title": "No HEALTHCHECK defined", "Severity": "LOW", "Message": "Add HEALTHCHECK instruction",
+        }]}]})[0]
+
+        self.assertEqual(finding["findingNature"], "hardening")
+        self.assertTrue(finding["contextRequired"])
+        self.assertIn("orchestrator", finding["contextReason"])
+        self.assertEqual(finding["impact"], {"type": "container_hardening"})
+        self.assertEqual(finding["reachability"], "unknown")
+        self.assertEqual(finding["applicability"], "unknown")
+        self.assertEqual(finding["confidence"], finding["detectionConfidence"])
+
     def test_trivy_normalization_severity_and_secret_scrubbing(self):
         raw = {
             "Results": [{"Target": "src/app.py", "Secrets": [{
@@ -67,6 +132,7 @@ class NormalizationTests(unittest.TestCase):
         finding = normalize("trivy", raw)[0]
         self.assertEqual(finding["category"], "secret")
         self.assertEqual(finding["severity"], "high")
+        self.assertEqual(finding["detectionConfidence"], "unknown")
         self.assertNotIn("ghp_FAKEcredentialvalue123456", json.dumps(finding))
 
     def test_semgrep_normalization_and_fingerprint_stability(self):
@@ -164,6 +230,93 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result["blockingRemediations"], 3)
 
 
+class ReportConsistencyTests(unittest.TestCase):
+    def test_all_report_artifacts_and_references_are_consistent(self):
+        class VulnerableScanner:
+            name = "trivy"
+
+            def execute(self, context):
+                findings = normalize("trivy", {"Results": [{"Target": "package-lock.json", "Vulnerabilities": [{
+                    "VulnerabilityID": "CVE-2024-12345", "PkgName": "example", "InstalledVersion": "1.0.0",
+                    "FixedVersion": "1.0.1", "Severity": "HIGH",
+                }]}]})
+                result = ScannerResult(
+                    self.name, "0.58.2", "completed_with_findings", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/trivy.json", finding_count=len(findings),
+                    coverage={"assessment": "unknown"},
+                )
+                return result, findings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "package-lock.json").write_text("{}", encoding="utf-8")
+            output = Path(temporary) / "output"
+            config = {"policy": {"failOn": ["high"], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            code, report = run_scan(root, output, config, [VulnerableScanner()])
+
+            project = json.loads((output / "project.json").read_text(encoding="utf-8"))
+            scan = json.loads((output / "scan.json").read_text(encoding="utf-8"))
+            findings = json.loads((output / "findings.json").read_text(encoding="utf-8"))
+            remediations = json.loads((output / "remediations.json").read_text(encoding="utf-8"))
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(code, 1)
+            self.assertEqual(project["schemaVersion"], 2)
+            self.assertEqual(scan["reportSchemas"]["findings"], 2)
+            self.assertEqual(scan["scanId"], report["scanId"])
+            self.assertEqual(summary["findings"]["total"], len(findings))
+            self.assertEqual(summary["total"], len(findings))
+            self.assertEqual(sum(summary["severity"].values()), len(findings))
+            self.assertEqual(sum(summary["categories"].values()), len(findings))
+            self.assertEqual(len(remediations), 1)
+            self.assertEqual(remediations[0]["findingCount"], len(remediations[0]["affectedFindings"]))
+            self.assertEqual(remediations[0]["affectedFindings"], [findings[0]["id"]])
+            self.assertEqual(remediations[0]["affectedFiles"], [findings[0]["location"]["file"]])
+            self.assertEqual(summary["gate"]["blockingFindingIds"], [findings[0]["id"]])
+            self.assertEqual(summary["gate"]["blockingFindings"], len(summary["gate"]["blockingFindingIds"]))
+            self.assertEqual(summary["coverage"]["scanners"]["trivy"]["status"], "completed_with_findings")
+            self.assertFalse((output / "comparison.json").exists())
+
+            summary["findings"]["total"] += 1
+            with self.assertRaises(ReportConsistencyError):
+                _validate_report_consistency(project, findings, remediations, summary, scan)
+            summary["findings"]["total"] -= 1
+
+            remediation = remediations[0]
+            remediation["affectedFindings"] = ["finding-missing"]
+            with self.assertRaises(ReportConsistencyError):
+                _validate_report_consistency(project, findings, remediations, summary, scan)
+            remediation["affectedFindings"] = [findings[0]["id"]]
+
+            summary["gate"]["blockingFindingIds"] = ["finding-missing"]
+            with self.assertRaises(ReportConsistencyError):
+                _validate_report_consistency(project, findings, remediations, summary, scan)
+
+    def test_consistency_failure_does_not_write_final_report_files(self):
+        class CleanScanner:
+            name = "test-clean"
+
+            def execute(self, context):
+                result = ScannerResult(
+                    self.name, "test", "clean", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/test-clean.json",
+                )
+                return result, []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            output = Path(temporary) / "output"
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            with patch("security_runner.runner._validate_report_consistency", side_effect=ReportConsistencyError("injected mismatch")):
+                with self.assertRaises(ReportConsistencyError):
+                    run_scan(root, output, config, [CleanScanner()])
+            self.assertTrue((output / "raw").is_dir())
+            for filename in ("project.json", "scan.json", "findings.json", "remediations.json", "summary.json"):
+                self.assertFalse((output / filename).exists())
+
+
 class RemediationTests(unittest.TestCase):
     def test_three_dependency_cves_group_as_one_upgrade_action(self):
         vulnerabilities = [
@@ -180,7 +333,25 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(remediations[0]["package"]["targetVersion"], "2.3.1")
         self.assertEqual(remediations[0]["findingCount"], 3)
 
-    def test_conflicting_fixed_versions_remain_one_reviewable_action(self):
+    def test_shared_package_fix_groups_findings_across_lockfiles(self):
+        findings = []
+        for path, cve in (
+            ("src/service-a/packages.lock.json", "CVE-2024-10001"),
+            ("src/service-b/packages.lock.json", "CVE-2024-10002"),
+        ):
+            findings.extend(normalize("trivy", {"Results": [{"Target": path, "Vulnerabilities": [{
+                "VulnerabilityID": cve, "PkgName": "BouncyCastle.Cryptography", "InstalledVersion": "2.2.1",
+                "FixedVersion": "2.3.1", "Severity": "HIGH",
+            }]}]}))
+
+        remediations = build_remediations(findings)
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(len(remediations), 1)
+        self.assertEqual(set(remediations[0]["affectedFindings"]), {finding["id"] for finding in findings})
+        self.assertEqual(remediations[0]["affectedFiles"], ["src/service-a/packages.lock.json", "src/service-b/packages.lock.json"])
+        self.assertEqual(remediations[0]["package"]["recommendedVersion"], "2.3.1")
+
+    def test_fixed_candidates_select_same_major_target_and_preserve_all_branches(self):
         findings = []
         for cve, fixed in (("CVE-2024-10001", "2.3.1"), ("CVE-2024-10002", "2.4.0")):
             findings.extend(normalize("trivy", {"Results": [{"Target": "packages.config", "Vulnerabilities": [{
@@ -189,18 +360,49 @@ class RemediationTests(unittest.TestCase):
             }]}]}))
         remediation = build_remediations(findings)[0]
         self.assertEqual(len(remediation["affectedFindings"]), 2)
-        self.assertIsNone(remediation["package"]["targetVersion"])
+        self.assertEqual(remediation["package"]["targetVersion"], "2.4.0")
+        self.assertEqual(remediation["package"]["recommendedVersion"], "2.4.0")
         self.assertEqual(remediation["package"]["candidateFixedVersions"], ["2.3.1", "2.4.0"])
-        self.assertIn("Confirm package constraints", remediation["summary"])
+        self.assertEqual(remediation["package"]["selectionReason"], "same_major_common_fixed_version")
 
-    def test_trivy_multiple_fixed_versions_are_candidates_not_one_target(self):
+    def test_multiple_fixed_versions_select_only_safe_same_major_upgrade(self):
         finding = normalize("trivy", {"Results": [{"Target": "packages.config", "Vulnerabilities": [{
             "VulnerabilityID": "CVE-2024-10003", "PkgName": "Example.Package", "InstalledVersion": "2.2.1",
             "FixedVersion": "2.3.1, 0.2.4", "Severity": "MEDIUM",
         }]}]})[0]
         remediation = build_remediations([finding])[0]
-        self.assertIsNone(remediation["package"]["targetVersion"])
+        self.assertEqual(remediation["package"]["recommendedVersion"], "2.3.1")
         self.assertEqual(remediation["package"]["candidateFixedVersions"], ["0.2.4", "2.3.1"])
+        self.assertEqual(remediation["package"]["upgradeCandidates"], ["2.3.1"])
+
+    def test_version_branch_prefers_patch_and_never_recommends_downgrade(self):
+        finding = normalize("trivy", {"Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+            "VulnerabilityID": "CVE-2024-43485", "PkgName": "System.Text.Json", "InstalledVersion": "8.0.4",
+            "FixedVersion": "6.0.10, 8.0.5", "Severity": "HIGH",
+        }]}]})[0]
+        remediation = build_remediations([finding])[0]
+        self.assertEqual(remediation["package"]["candidateFixedVersions"], ["6.0.10", "8.0.5"])
+        self.assertEqual(remediation["package"]["upgradeCandidates"], ["8.0.5"])
+        self.assertEqual(remediation["package"]["recommendedVersion"], "8.0.5")
+
+        downgrade = normalize("trivy", {"Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+            "VulnerabilityID": "CVE-2024-99999", "PkgName": "System.Text.Json", "InstalledVersion": "8.0.4",
+            "FixedVersion": "6.0.10", "Severity": "HIGH",
+        }]}]})[0]
+        downgrade_remediation = build_remediations([downgrade])[0]
+        self.assertIsNone(downgrade_remediation["package"]["recommendedVersion"])
+        self.assertEqual(downgrade_remediation["package"]["candidateFixedVersions"], ["6.0.10"])
+        self.assertEqual(downgrade_remediation["package"]["selectionReason"], "no_candidate_is_an_upgrade")
+
+        split_branches = []
+        for cve, fixed in (("CVE-2024-20001", "6.0.10"), ("CVE-2024-20002", "8.0.5")):
+            split_branches.extend(normalize("trivy", {"Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+                "VulnerabilityID": cve, "PkgName": "System.Text.Json", "InstalledVersion": "8.0.4",
+                "FixedVersion": fixed, "Severity": "HIGH",
+            }]}]}))
+        split_remediation = build_remediations(split_branches)[0]
+        self.assertIsNone(split_remediation["package"]["recommendedVersion"])
+        self.assertEqual(split_remediation["package"]["selectionReason"], "no_common_compatible_fix_line")
 
     def test_osv_cvss_numeric_scores_and_vectors(self):
         numeric = normalize("osv-scanner", {"results": [{"source": {"path": "requirements.txt"}, "packages": [{
@@ -250,9 +452,185 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(len(remediations), 1)
         self.assertEqual(remediations[0]["title"], "Define container health-check strategy")
         self.assertEqual(len(remediations[0]["affectedFiles"]), 25)
+        self.assertEqual(remediations[0]["findingNature"], "hardening")
+        self.assertTrue(remediations[0]["contextRequired"])
+        self.assertTrue(any("orchestrator" in reason for reason in remediations[0]["contextReasons"]))
+        self.assertEqual(remediations[0]["priorityReasons"], ["severity:low"])
 
 
 class ScannerContinuationTests(unittest.TestCase):
+    def test_raw_trivy_advisory_and_native_evidence_survive_normalization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "packages.lock.json").write_text("{}", encoding="utf-8")
+            output = Path(temporary) / "out"
+            raw_dir = output / "raw"
+            raw_dir.mkdir(parents=True)
+            context = ScannerContext(root, output, raw_dir, detect_project(root), 5)
+            native_title = "org.bouncycastle:bcprov-jdk18on affected by CVE-2024-30172"
+            native_description = "Upstream advisory includes Java package coordinates."
+            raw = {
+                "SchemaVersion": 2,
+                "ArtifactName": "workspace",
+                "ArtifactType": "filesystem",
+                "CreatedAt": "2026-10-01T00:00:00Z",
+                "Metadata": {},
+                "Results": [{"Target": "packages.lock.json", "Vulnerabilities": [{
+                    "VulnerabilityID": "CVE-2024-30172", "Title": native_title,
+                    "Description": native_description, "PkgName": "BouncyCastle.Cryptography",
+                    "InstalledVersion": "2.2.1", "PkgType": "nuget", "Severity": "HIGH",
+                }]}],
+            }
+            with patch("security_runner.scanners.Scanner._version", return_value="0.58.2"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps(raw), "", 0)
+            ):
+                result, findings = TrivyScanner().execute(context)
+
+            persisted_raw = json.loads((raw_dir / "trivy.json").read_text(encoding="utf-8"))
+            self.assertEqual(result.status, "completed_with_findings")
+            self.assertEqual(persisted_raw["Results"][0]["Vulnerabilities"][0]["Title"], native_title)
+            self.assertEqual(persisted_raw["Results"][0]["Vulnerabilities"][0]["Description"], native_description)
+            self.assertEqual(findings[0]["title"], "BouncyCastle.Cryptography 2.2.1 affected by CVE-2024-30172")
+            self.assertEqual(findings[0]["scannerEvidence"][0]["nativeTitle"], native_title)
+            self.assertEqual(findings[0]["scannerEvidence"][0]["nativeDescription"], native_description)
+
+    def test_osv_unsupported_dotnet_manifest_is_not_generic_not_applicable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "App.csproj").write_text("<Project />", encoding="utf-8")
+            project = detect_project(root)
+            output = Path(temporary) / "output"
+            raw = output / "raw"
+            raw.mkdir(parents=True)
+            context = ScannerContext(root, output, raw, project, 5)
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+
+            with patch("security_runner.scanners.Scanner._version", return_value="osv-scanner version: 2.3.3"), patch(
+                "security_runner.scanners._run_process"
+            ) as process:
+                result, findings = OsvScanner().execute(context)
+                self.assertEqual(result.status, "unsupported_manifest")
+                self.assertEqual(result.reason_code, "unsupported_dependency_manifest")
+                self.assertEqual(result.coverage["candidateArtifacts"], ["App.csproj"])
+                self.assertEqual(result.coverage["supportedArtifacts"], [])
+                self.assertEqual(result.coverage["unsupportedArtifacts"], ["App.csproj"])
+                process.assert_not_called()
+
+            code, report = run_scan(root, Path(temporary) / "scan-output", config, [OsvScanner()])
+            self.assertEqual(code, 2)
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "indeterminate")
+            summary = json.loads((Path(temporary) / "scan-output" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["coverage"]["scanners"]["osv-scanner"]["status"], "unsupported_manifest")
+            self.assertEqual(summary["coverage"]["warnings"][0]["code"], "unsupported_dependency_manifest")
+
+    def test_osv_runs_for_supported_nuget_lockfiles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "App.csproj").write_text("<Project />", encoding="utf-8")
+            (root / "packages.lock.json").write_text("{}", encoding="utf-8")
+            project = detect_project(root)
+            context = ScannerContext(root, root / "out", root / "out" / "raw", project, 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch("security_runner.scanners.Scanner._version", return_value="osv-scanner version: 2.3.3"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps({"results": []}), "", 0)
+            ) as process:
+                result, findings = OsvScanner().execute(context)
+            process.assert_called_once()
+            self.assertEqual(result.status, "clean")
+            self.assertEqual(result.coverage["assessment"], "partial")
+            self.assertEqual(result.coverage["supportedArtifacts"], ["packages.lock.json"])
+            self.assertEqual(result.coverage["unsupportedArtifacts"], ["App.csproj"])
+            self.assertEqual(findings, [])
+
+    def test_semgrep_clean_status_exposes_partial_coverage_facts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "App.cs").write_text("class App {}", encoding="utf-8")
+            (root / "app.py").write_text("print('safe')", encoding="utf-8")
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            raw_output = {
+                "version": "1.99.0",
+                "results": [],
+                "errors": [{"type": "PartialParsing", "code": 3, "path": "App.cs"}],
+                "paths": {"scanned": ["/workspace/App.cs"]},
+                "skipped_rules": [],
+            }
+            with patch("security_runner.scanners.Scanner._version", return_value="1.99.0"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps(raw_output), "", 0)
+            ):
+                code, report = run_scan(root, Path(temporary) / "out", config, [SastScanner()])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(report["scanners"][0]["status"], "clean")
+            coverage = report["scanners"][0]["coverage"]
+            self.assertEqual(coverage["assessment"], "partial")
+            self.assertEqual(coverage["filesDiscovered"], 2)
+            self.assertEqual(coverage["filesAnalyzed"], 1)
+            self.assertEqual(coverage["filesDiscovered"], 2)
+            self.assertEqual(coverage["filesAnalyzed"], 1)
+            self.assertNotIn("filesSkipped", coverage)
+            self.assertEqual(coverage["pathsReportedScanned"], 1)
+            self.assertEqual(coverage["csharpFilesAnalyzed"], 1)
+            self.assertEqual(coverage["parseErrors"], 1)
+            self.assertIsNone(coverage["rulesLoaded"])
+            self.assertEqual(coverage["rulesetsConfigured"], ["p/security-audit"])
+            self.assertEqual(report["securityGate"]["status"], "passed")
+            summary = json.loads((Path(temporary) / "out" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["coverage"]["scanners"]["semgrep"]["assessment"], "partial")
+            self.assertEqual(summary["coverage"]["warnings"][0]["code"], "semgrep_partial_coverage")
+
+            complete_output = {
+                "version": "1.99.0", "results": [], "errors": [],
+                "paths": {"scanned": ["/workspace/App.cs"], "skipped": {"paths": []}},
+                "skipped_rules": [], "stats": {"rulesLoaded": 15},
+            }
+            with patch("security_runner.scanners.Scanner._version", return_value="1.99.0"), patch(
+                "security_runner.scanners._run_process", return_value=(json.dumps(complete_output), "", 0)
+            ):
+                _, complete_report = run_scan(root, Path(temporary) / "complete-out", config, [SastScanner()])
+            self.assertEqual(complete_report["scanners"][0]["status"], "clean")
+            self.assertEqual(complete_report["scanners"][0]["coverage"]["assessment"], "complete")
+            self.assertEqual(complete_report["scanners"][0]["coverage"]["rulesLoaded"], 15)
+
+    def test_launcher_timestamp_is_reused_in_scan_metadata_and_logs(self):
+        class CleanScanner:
+            name = "test-clean"
+
+            def execute(self, context):
+                result = ScannerResult(
+                    self.name, "test", "clean", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/test-clean.json",
+                )
+                return result, []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            started_at = "2026-10-01T13:42:18.5320000+00:00"
+            scan_id = "a8f55dfc-a41a-4c28-9808-990706ef8a22"
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            with patch.dict(os.environ, {"SECURITY_SCAN_STARTED_AT": started_at, "SECURITY_SCAN_ID": scan_id}), patch(
+                "builtins.print"
+            ) as log:
+                code, report = run_scan(root, Path(temporary) / "output", config, [CleanScanner()])
+
+            saved_report = json.loads((Path(temporary) / "output" / "scan.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(report["scanId"], scan_id)
+            self.assertEqual(report["startedAt"], started_at)
+            self.assertEqual(saved_report["startedAt"], started_at)
+            self.assertTrue(any(started_at in str(call.args) for call in log.call_args_list))
+            self.assertIsInstance(saved_report["finishedAt"], str)
+            self.assertGreaterEqual(saved_report["durationMs"], 0)
+            started = datetime.fromisoformat(saved_report["startedAt"].replace("Z", "+00:00"))
+            finished = datetime.fromisoformat(saved_report["finishedAt"].replace("Z", "+00:00"))
+            self.assertLessEqual(abs((finished - started).total_seconds() * 1000 - saved_report["durationMs"]), 2)
+            self.assertFalse((Path(temporary) / "output" / "comparison.json").exists())
+
     def test_parser_failure_isolated_and_run_marked_incomplete(self):
         class LaterCleanScanner:
             name = "later-clean"
@@ -440,6 +818,7 @@ class ScannerContinuationTests(unittest.TestCase):
             result, findings = OsvScanner(enabled=False).execute(context)
             self.assertEqual(result.status, "skipped")
             self.assertEqual(result.reason, "disabled by configuration")
+            self.assertEqual(result.coverage["assessment"], "not_applicable")
             self.assertEqual(findings, [])
 
     def test_non_applicable_osv_is_not_reported_as_clean(self):
