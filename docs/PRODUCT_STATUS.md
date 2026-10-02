@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-10-01
 **Current version:** 0.2.0
-**Current milestone:** M1.3 - Security Hardening
+**Current milestone:** M2 - Baseline and Finding Diff
 **Overall status:** IN PROGRESS
 
 ## Product Goal
@@ -25,18 +25,18 @@ Developer / CI
 - The Python runner owns project detection, scanner adapters, parsing, normalized findings, remediation grouping, policy evaluation, and reports.
 - The runner contract is `/workspace` (read-only), `/output` (scan-specific writable volume), and `SECURITY_SCAN_ID`.
 - Local mode uses bind mounts. Remote mode stages files through Docker stdin/stdout and uniquely named volumes using the digest-pinned Alpine tar helper.
-- Every scan has one full GUID, one ephemeral runner container, one isolated source volume and output volume in volume mode, and one report directory under `<output-base>/<scan-id-without-hyphens>`.
+- Every scan has one full GUID, one ephemeral runner container, one isolated source volume and output volume in volume mode, and one report directory under `<output-base>/YYYY-MM-DD/HH-mm-ss_<short-scan-id>` using the captured UTC start time.
 - Scanner caches are per-container. No shared mutable cache, server, queue, database, or Kubernetes integration exists.
 
 ## Current Capabilities
 
 - Scanner image: Trivy 0.58.2, OSV-Scanner 2.3.3, Semgrep 1.99.0; image default is `vesper-runner:0.2.0`.
-- Host CLI: .NET 10 Native AOT; Windows `win-x64` is the verified distribution target.
+- Host CLI: .NET 10 Native AOT; Windows `win-x64` and Linux `linux-x64` have been published and runtime-tested.
 - Docker endpoint classification supports npipe, Unix socket, SSH, loopback and remote TCP/HTTP(S); Docker calls are pinned to the context/host selected at scan start.
 - Local bind and remote volume workspace modes; source archives exclude common generated directories and enforce byte/file/per-file ceilings.
 - Scan-specific report directories, labeled Docker resources, bounded Docker operation timeouts, runner limits, fail-closed execution completeness, and per-scan cleanup.
-- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts.
-- Current scanner and policy states distinguish clean/findings/not-applicable/skipped/failed/timeout and completed/incomplete execution from passed/failed/indeterminate gate status.
+- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts; `comparison.json` is reserved for requested baseline comparisons.
+- Scanner execution status is separate from coverage assessment and policy gate; `unsupported_manifest` is explicit and cannot be treated as clean. Reports use schema v2 and validate internal totals/references before writing final JSON.
 
 ## Milestones
 
@@ -119,7 +119,7 @@ Developer / CI
 #### Completed
 
 - Immutable `ScanExecutionContext` supplies one GUID to runner/container/volume labels and scan metadata.
-- Unique container, source/output/config volumes, helper names, and scan-ID output child directories.
+- Unique container, source/output/config volumes, helper names, and scan-specific output directories.
 - Resource labels include managed state, full scan ID, resource type, and sanitized project name. Cleanup verifies labels and removes only the current invocation's exact resources.
 - Configurable per-scan CPU/memory/PID limits. No shared writable cache or worker container.
 
@@ -197,7 +197,7 @@ Developer / CI
 
 ### M2 - Baseline and Finding Diff
 
-**Status:** PLANNED
+**Status:** IN PROGRESS
 
 **Goal:** Distinguish new, existing, changed, and resolved findings without losing raw findings or scanner evidence.
 
@@ -209,8 +209,31 @@ Developer / CI
 
 - Database/history service, hosted orchestration, or automatic remediation.
 
+#### In Progress
+
+- New scan results are grouped by UTC execution date and time with a short scan-ID suffix. The full `scanId` remains authoritative in `scan.json`.
+- One UTC `DateTimeOffset` is captured in `ScanExecutionContext` and reused for the result path, launcher/runner start logs, and `scan.json`; `finishedAt` and `durationMs` are persisted with it.
+- `vesper report` and `vesper gate` read both date-grouped results and legacy `<scan-id>/` results without migrating old output.
+- Baseline comparison and `comparison.json` generation are not implemented yet; ordinary scans do not create `comparison.json`. When added, comparison metadata must reuse `scanId` and `startedAt` from `scan.json`, not generate another timestamp.
+- Report schema v2 marks `project.json`, `scan.json`, and `summary.json`; findings/remediations remain arrays with per-item schema markers and a schema manifest in `scan.json`. Legacy summary aliases remain and are validated for equality.
+- Project inventory reports artifact aggregates and excluded transient/output paths. Findings preserve native scanner titles/descriptions/IDs separately from package-aware normalized titles, confidence/applicability/reachability, finding nature, and contextual hardening metadata.
+- Scanner coverage is explicit: OSV reports supported/covered/unsupported dependency manifests; Semgrep reports measurable source/path/error metrics. Semgrep only claims complete when its output provides scanned/skipped lists and a positive rules-loaded count; the pinned 1.99.0 output omits that count, so otherwise-clean coverage remains unknown.
+- Fixed-version recommendations are semantic-version checked, never downgrade, and select only a common compatible fix line that resolves every grouped advisory; all native candidates and the selection rationale remain in remediation output.
+- Before writing final JSON artifacts, report invariants validate count aliases, scanner provenance bounds, remediation references/files/identifiers, gate blocker references, and schema markers.
+
+#### Audit Evidence
+
+- The final `Dast` self-scan found two `.csproj` files and no NuGet lockfile; OSV-Scanner ran on the fixture's `package-lock.json`. Its sibling `package.json` is marked covered, while the two unrelated `.csproj` candidates are explicitly warned as unsupported. This matches OSV-Scanner 2.3.3's documented NuGet inputs.
+- Semgrep 1.99.0 reported 39 paths, including 12 C# files; Vesper matched 21 detected source candidates, observed one `PartialParsing` error, and reported partial coverage. Skipped-path count was omitted because output did not provide it. Its JSON does not report rules loaded, so `rulesLoaded` remains unknown and clean execution is not presented as complete coverage.
+- The final live scan emitted schema-v2 metadata, an 8-artifact project inventory, 38 findings, and 36 remediations; all artifact/count/reference invariants passed. The configured security gate returned 1 as expected. A synthetic regression preserves 25 DS026 findings individually and groups them into one contextual hardening remediation.
+- The live minimist finding at 0.0.8 selects 0.2.4 as the highest common patch threshold on its 0.x minor line while preserving other candidates. Regression cases verify `System.Text.Json` 8.0.4 chooses 8.0.5 over 6.0.10, downgrade refusal, and no common target across disjoint branches.
+
 #### Acceptance criteria
 
+- [x] New scans use UTC `YYYY-MM-DD/HH-mm-ss_<short-scan-id>` directories, preserve the full scan ID in metadata, and retain read compatibility for legacy output directories.
+- [x] Schema-v2 report metadata, measured scanner coverage, project inventory, native evidence, remediation rationale, and pre-write cross-artifact validation are deterministic and regression-tested.
+- [x] Supported OSV manifests are distinguished from unsupported project descriptors; Semgrep coverage is based on observed file/error/rule metrics and never claims complete when loaded-rule count is unavailable.
+- [x] HEALTHCHECK and dependency reports preserve individual evidence while grouping shared fixes and documenting priority rationale.
 - [ ] Baseline creation and comparison are deterministic.
 - [ ] Findings retain audit evidence; status changes do not alter finding identity.
 - [ ] New-finding gate behavior has focused tests.
@@ -343,3 +366,4 @@ DAST (including ZAP/Nuclei), hosted APIs/UI, databases, queues, Kubernetes Jobs,
 - Documented M2 baseline/diff as the next product milestone and recorded CI, DAST, and hosted execution as later/not implemented.
 - Reverified the empty-scan indeterminate exit, read-only workspace, same/different-project concurrency, and current-tree self-scan with the final AOT binary/image.
 - Completed M1.3 after Linux filesystem/AOT/signal integration, scanner-envelope and network-failure tests, archive-entry/metadata bounds, and hash-enforced runner build verification. A final dangling-symlink review added direct attribute checks and Linux regression cases before completion. macOS and real daemon-loss behavior remain explicitly UNVERIFIED; runner digest enforcement is accepted for M3 release work.
+- Started the M2 result-organization slice: new results use one captured UTC timestamp for date/time grouping and scan metadata; legacy report lookup remains supported. Baseline comparison is still unimplemented.
