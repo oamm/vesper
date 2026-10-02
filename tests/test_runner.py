@@ -6,14 +6,183 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from security_runner.baseline import _resolution_evidence
 from security_runner.detection import detect_project
 from security_runner.models import ScannerContext, ScannerResult
-from security_runner.normalization import deduplicate, normalize, normalize_grype, normalize_severity
+from security_runner.normalization import deduplicate, normalize, normalize_gitleaks, normalize_grype, normalize_severity
 from security_runner.policy import evaluate
 from security_runner.remediations import build_remediations
 from security_runner.runner import ReportConsistencyError, _validate_report_consistency, run_scan
 from security_runner.components import normalize_components
-from security_runner.scanners import GrypeScanner, OsvScanner, SastScanner, SyftScanner, TrivyScanner
+from security_runner.posture import normalize_repository_identity, normalize_scorecard, validate_scorecard
+from security_runner.scanners import GitleaksScanner, GrypeScanner, OsvScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
+
+
+class ScorecardTests(unittest.TestCase):
+    def _raw(self):
+        return {
+            "date": "2026-10-02T00:00:00Z",
+            "repo": {"name": "github.com/example/project", "commit": "abc123"},
+            "scorecard": {"version": "v5.5.0"},
+            "score": 7.5,
+            "checks": [
+                {"name": "Token-Permissions", "score": 0, "reason": "Workflow grants broad permissions.", "documentation": {"short": "Token permissions", "url": "https://scorecard.dev/checks/token-permissions"}},
+                {"name": "License", "score": 10, "reason": "License file found.", "details": [{"path": "LICENSE"}]},
+                {"name": "Branch-Protection", "score": 5, "reason": "Provider evidence unavailable."},
+            ],
+        }
+
+    def test_normalizes_mixed_posture_deterministically(self):
+        posture = normalize_scorecard(self._raw(), Path("."), "git@github.com:example/project.git", "abc123")
+        self.assertEqual([item["id"] for item in posture["checks"]], ["Branch-Protection", "License", "Token-Permissions"])
+        self.assertEqual(posture["counts"], {"pass": 1, "fail": 1, "warn": 1, "unknown": 0, "not_applicable": 0, "error": 0})
+        self.assertEqual(posture["repository"], {"provider": "github", "origin": "github.com/example/project", "owner": "example", "name": "project", "commit": "abc123"})
+        self.assertEqual(posture["checks"][1]["evidence"], ["path=LICENSE"])
+
+    def test_rejects_invalid_scorecard_envelopes(self):
+        with self.assertRaises(ValueError):
+            validate_scorecard({"checks": [{"score": 10}]})
+        with self.assertRaises(ValueError):
+            validate_scorecard({"checks": "not-an-array"})
+
+    def test_zero_checks_are_unknown_and_process_failure_is_fail_closed(self):
+        empty = normalize_scorecard({"checks": [], "score": 0}, Path("."), None, None)
+        self.assertEqual(empty["coverage"]["assessment"], "unknown")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".git").mkdir()
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch.dict(os.environ, {"SECURITY_SCAN_INCLUDE_GIT": "true"}), patch(
+                "security_runner.scanners.ScorecardScanner._version", return_value="v5.5.0"
+            ), patch("security_runner.scanners._run_process", return_value=("{}", "provider unavailable", 2)):
+                result, posture_findings = ScorecardScanner().execute(context)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(posture_findings, [])
+            self.assertFalse((output / "posture.json").exists())
+
+    def test_scorecard_is_not_applicable_without_explicit_git_capability(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".git").mkdir()
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch.dict(os.environ, {}, clear=True):
+                result, posture_findings = ScorecardScanner().execute(context)
+            self.assertEqual(result.status, "not_applicable")
+            self.assertEqual(result.reason_code, "repository_posture_not_requested")
+            self.assertEqual(posture_findings, [])
+
+    def test_repository_identity_strips_credentials_and_normalizes_ssh(self):
+        self.assertEqual(normalize_repository_identity("https://token:secret@github.com/example/project.git", "deadbeef")["origin"], "github.com/example/project")
+        self.assertEqual(normalize_repository_identity("git@github.com:example/project.git", None)["provider"], "github")
+
+    def test_scorecard_execution_writes_posture_without_findings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / ".git").mkdir()
+            (root / "README.md").write_text("fixture\n", encoding="utf-8")
+            output = Path(temporary) / "output"
+            config = {"policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None}, "baseline": {"failOnNew": ["high"]}, "timeouts": {}}
+            raw = self._raw()
+            with patch.dict(os.environ, {"SECURITY_SCAN_INCLUDE_GIT": "true", "SECURITY_SCAN_REPOSITORY_COMMIT": "abc123"}), patch(
+                "security_runner.scanners.ScorecardScanner._version", return_value="v5.5.0"
+            ), patch("security_runner.scanners._run_process", return_value=(json.dumps(raw), "", 0)):
+                code, _ = run_scan(root, output, config, [ScorecardScanner()])
+            posture = json.loads((output / "posture.json").read_text(encoding="utf-8"))
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            scan = json.loads((output / "scan.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(summary["posture"]["checks"], 3)
+            self.assertEqual(scan["reportSchemas"]["posture"], 1)
+            self.assertFalse((output / "findings.json").read_text(encoding="utf-8").strip() not in {"[]", "[]\n"})
+            self.assertEqual(posture["repository"]["provider"], "local")
+
+
+class GitleaksTests(unittest.TestCase):
+    def _raw(self, commit="abc123"):
+        return [{
+            "Description": "Generic API key",
+            "RuleID": "generic-api-key",
+            "Match": "super-secret-value",
+            "Secret": "super-secret-value",
+            "Fingerprint": "commit:config.env:generic-api-key:super-secret-value",
+            "File": "config.env",
+            "StartLine": 2,
+            "StartColumn": 1,
+            "Commit": commit,
+            "Date": "2026-10-02T00:00:00Z",
+        }]
+
+    def test_normalization_preserves_history_provenance_without_secret_material(self):
+        finding = normalize_gitleaks(self._raw())[0]
+        encoded = json.dumps(finding)
+        self.assertNotIn("super-secret-value", encoded)
+        self.assertEqual(finding["fingerprintVersion"], 2)
+        self.assertEqual(finding["secretEvidence"]["scope"], "historical")
+        self.assertEqual(finding["secretEvidence"]["commit"], "abc123")
+        self.assertTrue(finding["location"]["history"])
+        self.assertEqual(finding["location"]["file"], "config.env")
+
+    def test_history_commit_is_part_of_secret_identity(self):
+        first = normalize_gitleaks(self._raw("commit-a"))[0]
+        second = normalize_gitleaks(self._raw("commit-b"))[0]
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_gitleaks_output_is_redacted_and_history_mode_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".git").mkdir()
+            (root / "config.env").write_text("API_KEY=super-secret-value\n", encoding="utf-8")
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch.dict(os.environ, {"SECURITY_SCAN_INCLUDE_GIT": "true"}), patch(
+                "security_runner.scanners.GitleaksScanner._version", return_value="8.30.1"
+            ), patch("security_runner.scanners._run_process", return_value=(json.dumps(self._raw()), "", 1)):
+                result, findings = GitleaksScanner().execute(context)
+            self.assertEqual(result.status, "completed_with_findings")
+            self.assertEqual(result.coverage["assessment"], "complete")
+            raw = (output / "raw" / "gitleaks.json").read_text(encoding="utf-8")
+            self.assertNotIn("super-secret-value", raw)
+            self.assertEqual(len(findings), 1)
+
+    def test_gitleaks_is_not_applicable_without_explicit_include_git(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".git").mkdir()
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            context.raw_dir.mkdir(parents=True)
+            with patch.dict(os.environ, {}, clear=True):
+                result, findings = GitleaksScanner().execute(context)
+            self.assertEqual(result.status, "not_applicable")
+            self.assertEqual(result.reason_code, "git_history_not_requested")
+            self.assertEqual(findings, [])
+
+    def test_shallow_git_history_is_partial_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            git_dir = root / ".git"
+            git_dir.mkdir()
+            (git_dir / "shallow").write_text("commit\n", encoding="utf-8")
+            output = root / "out"
+            context = ScannerContext(root, output, output / "raw", detect_project(root), 5)
+            coverage = GitleaksScanner().coverage_from_output([], context)
+            self.assertEqual(coverage["assessment"], "partial")
+            self.assertEqual(coverage["repositoryHistory"], "shallow")
+
+    def test_historical_secret_resolution_requires_complete_gitleaks_history(self):
+        finding = {"capability": "secret", "target": "aws.txt", "historical": True}
+        complete = [{"name": "gitleaks", "status": "clean", "coverage": {"assessment": "complete", "repositoryHistory": "complete"}}]
+        shallow = [{"name": "gitleaks", "status": "clean", "coverage": {"assessment": "partial", "repositoryHistory": "shallow"}}]
+        unavailable = [{"name": "gitleaks", "status": "not_applicable", "coverage": {"assessment": "not_applicable"}}]
+        self.assertIsNone(_resolution_evidence(finding, complete, {})[0])
+        self.assertEqual(_resolution_evidence(finding, shallow, {})[0], "coverage_unknown")
+        self.assertEqual(_resolution_evidence(finding, unavailable, {})[0], "capability_not_executed")
 
 
 class DetectionTests(unittest.TestCase):

@@ -20,7 +20,8 @@ from security_runner.normalization import SEVERITY_WEIGHT, deduplicate
 from security_runner.policy import evaluate
 from security_runner.remediations import PRIORITY_BY_SEVERITY, PRIORITY_ORDER, build_remediations
 from security_runner.components import ComponentError, component_summary, validate_component_inventory
-from security_runner.scanners import GrypeScanner, OsvScanner, SastScanner, SyftScanner, TrivyScanner
+from security_runner.posture import PostureError, posture_summary, validate_posture
+from security_runner.scanners import GitleaksScanner, GrypeScanner, OsvScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
 from security_runner import __version__
 
 EXIT_GATE_FAILED = 1
@@ -34,6 +35,8 @@ SCANNER_CAPABILITIES = {
     "semgrep": ("sast",),
     "syft": (),
     "grype": ("dependency",),
+    "gitleaks": ("secret",),
+    "scorecard": (),
 }
 
 
@@ -108,9 +111,14 @@ def run_scan(
         scanners.append(SyftScanner(scanner_config.get("syft", {}).get("enabled", False)))
     if "grype" in scanner_config:
         scanners.append(GrypeScanner(scanner_config.get("grype", {}).get("enabled", False)))
+    if "gitleaks" in scanner_config:
+        scanners.append(GitleaksScanner(scanner_config.get("gitleaks", {}).get("enabled", False)))
+    if "scorecard" in scanner_config:
+        scanners.append(ScorecardScanner(scanner_config.get("scorecard", {}).get("enabled", False)))
     all_findings: list[dict[str, Any]] = []
     scanner_results = []
     component_inventory = None
+    posture = None
     syft_result = None
     for scanner in scanners:
         if scanner.name == "grype" and hasattr(scanner, "set_input_coverage"):
@@ -126,6 +134,10 @@ def run_scan(
             if component_inventory is not None:
                 raise ReportConsistencyError("Multiple scanners produced component inventories.")
             component_inventory = scanner.extra_artifacts["components"]
+        if "posture" in getattr(scanner, "extra_artifacts", {}):
+            if posture is not None:
+                raise ReportConsistencyError("Multiple scanners produced posture artifacts.")
+            posture = scanner.extra_artifacts["posture"]
 
     print("[runner] Normalizing results...", flush=True)
     findings = deduplicate(all_findings)
@@ -173,7 +185,7 @@ def run_scan(
             gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
         else:
             gate = {**gate, "baselineDelta": _baseline_delta(comparison, remediations, config)}
-    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config)
+    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config, posture)
     if comparison is not None:
         summary["baselineComparison"] = {
             "baselineId": comparison["baseline"]["baselineId"],
@@ -182,6 +194,8 @@ def run_scan(
     report_schemas = {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2}
     if component_inventory is not None:
         report_schemas["components"] = 1
+    if posture is not None:
+        report_schemas["posture"] = 1
     if comparison is not None:
         report_schemas["comparison"] = comparison["schemaVersion"]
     scan_report = {
@@ -207,7 +221,7 @@ def run_scan(
     project_report["projectNameSource"] = "launcher-workspace-directory" if os.environ.get("SECURITY_SCAN_PROJECT_NAME") else "workspace-directory"
     if comparison is not None:
         validate_comparison(comparison, baseline, findings, scan_report)
-    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory)
+    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory, posture)
     (output / "project.json").write_text(json.dumps(project_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "remediations.json").write_text(json.dumps(remediations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -215,6 +229,8 @@ def run_scan(
     (output / "scan.json").write_text(json.dumps(scan_report, indent=2) + "\n", encoding="utf-8")
     if component_inventory is not None:
         (output / "components.json").write_text(json.dumps(component_inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if posture is not None:
+        (output / "posture.json").write_text(json.dumps(posture, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if comparison is not None:
         (output / "comparison.json").write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_summary(project.technologies, summary, remediations, scanner_results)
@@ -232,6 +248,7 @@ def _summary(
     project: Any,
     component_inventory: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
+    posture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
@@ -281,6 +298,8 @@ def _summary(
                 if (finding.get("package") or {}).get("componentId")
             }),
         }
+    if posture is not None:
+        summary["posture"] = posture_summary(posture)
     return summary
 
 
@@ -501,6 +520,7 @@ def _validate_report_consistency(
     scan: dict[str, Any],
     comparison: dict[str, Any] | None = None,
     component_inventory: dict[str, Any] | None = None,
+    posture: dict[str, Any] | None = None,
 ) -> None:
     def require(condition: bool, message: str) -> None:
         if not condition:
@@ -519,6 +539,8 @@ def _validate_report_consistency(
         expected_schemas["components"] = 1
     if comparison is not None:
         expected_schemas["comparison"] = 1
+    if posture is not None:
+        expected_schemas["posture"] = 1
     require(scan.get("reportSchemas") == expected_schemas, "Scan report schema manifest is inconsistent.")
     if comparison is None:
         require("baselineComparison" not in summary and "baselineId" not in scan, "Baseline metadata exists without a comparison report.")
@@ -545,6 +567,14 @@ def _validate_report_consistency(
             validate_component_inventory(component_inventory)
             require(summary.get("components") == component_summary(component_inventory), "Component summary is inconsistent.")
         except ComponentError as exc:
+            raise ReportConsistencyError(str(exc)) from exc
+    if posture is None:
+        require("posture" not in summary, "Posture summary exists without a posture inventory.")
+    else:
+        try:
+            validate_posture(posture)
+            require(summary.get("posture") == posture_summary(posture), "Posture summary is inconsistent.")
+        except PostureError as exc:
             raise ReportConsistencyError(str(exc)) from exc
     component_ids = {
         component.get("id") for component in (component_inventory or {}).get("components", [])

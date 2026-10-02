@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from security_runner.models import ScannerContext, ScannerResult
-from security_runner.normalization import normalize, normalize_grype
+from security_runner.normalization import normalize, normalize_grype, normalize_gitleaks
 from security_runner.components import ComponentError, normalize_components
+from security_runner.posture import git_remote, normalize_scorecard, validate_scorecard
 
 
 class ScanTimeout(Exception):
@@ -22,6 +23,7 @@ class Scanner(ABC):
     name: str
     output_name: str | None = None
     version_command: list[str]
+    accepts_list_output = False
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
@@ -35,7 +37,7 @@ class Scanner(ABC):
     def command(self, context: ScannerContext) -> list[str]:
         raise NotImplementedError
 
-    def validate_schema(self, raw: dict[str, Any]) -> str | None:
+    def validate_schema(self, raw: Any) -> str | None:
         raise ValueError("scanner has no supported output schema validator")
 
     def not_applicable_result(
@@ -50,11 +52,14 @@ class Scanner(ABC):
             {"assessment": "not_applicable", "candidateArtifacts": context.project.artifacts},
         )
 
-    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+    def coverage_from_output(self, raw: Any, context: ScannerContext) -> dict[str, Any]:
         return {"assessment": "unknown"}
 
-    def findings_from_output(self, raw: dict[str, Any], context: ScannerContext) -> list[dict[str, Any]]:
+    def findings_from_output(self, raw: Any, context: ScannerContext) -> list[dict[str, Any]]:
         return normalize(self.name, raw)
+
+    def sanitize_output(self, raw: Any) -> Any:
+        return sanitize_data(raw)
 
     def additional_artifacts(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
         return {}
@@ -64,6 +69,9 @@ class Scanner(ABC):
 
     def finalize_coverage(self, coverage: dict[str, Any], status: str) -> dict[str, Any]:
         return coverage
+
+    def process_environment(self, context: ScannerContext) -> dict[str, str] | None:
+        return None
 
     def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
         self.extra_artifacts = {}
@@ -94,7 +102,7 @@ class Scanner(ABC):
         else:
             try:
                 output, stderr, process_returncode = _run_process(
-                    self.command(context), context.workspace, context.timeout_seconds
+                    self.command(context), context.workspace, context.timeout_seconds, self.process_environment(context)
                 )
                 try:
                     if not output.strip():
@@ -105,7 +113,7 @@ class Scanner(ABC):
                     error = "scanner emitted empty or invalid JSON"
                     raw = {"_runner": {"message": error, "returnCode": process_returncode}}
                 else:
-                    if not isinstance(raw, dict):
+                    if not isinstance(raw, dict) and not (self.accepts_list_output and isinstance(raw, list)):
                         status = "failed"
                         error = "scanner JSON root must be an object"
                         raw = {"_runner": {"message": error, "rootType": type(raw).__name__}}
@@ -125,7 +133,7 @@ class Scanner(ABC):
                 error = _safe_text(str(exc))
                 raw = {"_runner": {"message": "Scanner could not be executed"}}
 
-        safe_raw = sanitize_data(raw)
+        safe_raw = self.sanitize_output(raw)
         if parsed_successfully:
             try:
                 coverage.update(self.coverage_from_output(safe_raw, context))
@@ -646,9 +654,174 @@ class GrypeScanner(Scanner):
         return ["grype", "--quiet", "sbom:/output/raw/syft.cdx.json", "--output", "json"]
 
 
-def _run_process(command: list[str], cwd: Path, timeout: int) -> tuple[str, str, int]:
+class ScorecardScanner(Scanner):
+    name = "scorecard"
+    output_name = "scorecard"
+    version_command = ["scorecard", "version"]
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return os.environ.get("SECURITY_SCAN_INCLUDE_GIT", "").casefold() == "true" and (context.workspace / ".git").exists()
+
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        if os.environ.get("SECURITY_SCAN_INCLUDE_GIT", "").casefold() != "true":
+            return (
+                "not_applicable", "repository_posture_not_requested",
+                "Scorecard local posture analysis is disabled unless --include-git is explicitly requested.",
+                {"assessment": "not_applicable", "mode": "local", "repositoryHistory": "not_requested"},
+            )
+        return (
+            "not_applicable", "git_repository_unavailable",
+            "Scorecard local posture analysis requires Git metadata; the workspace did not contain .git.",
+            {"assessment": "not_applicable", "mode": "local", "repositoryHistory": "unavailable"},
+        )
+
+    def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
+        return {
+            "assessment": "unknown",
+            "mode": "local",
+            "provider": "local",
+            "providerChecks": 0,
+            "targetCounts": {"attempted": 1, "completed": 0, "failed": 0},
+        }
+
+    def validate_schema(self, raw: dict[str, Any]) -> str:
+        return validate_scorecard(raw)
+
+    def coverage_from_output(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        posture = normalize_scorecard(raw, context.workspace, git_remote(context.workspace), os.environ.get("SECURITY_SCAN_REPOSITORY_COMMIT"))
+        summary = posture["counts"]
+        return {
+            "assessment": posture["coverage"]["assessment"],
+            "mode": "local",
+            "provider": posture["repository"].get("provider", "local"),
+            "targetCounts": {"attempted": 1, "completed": 1, "failed": 0},
+            "checkCount": len(posture["checks"]),
+            "passed": summary.get("pass", 0),
+            "failed": summary.get("fail", 0),
+            "warn": summary.get("warn", 0),
+            "unknown": summary.get("unknown", 0),
+            "notApplicable": summary.get("not_applicable", 0),
+            "providerChecks": 0,
+        }
+
+    def findings_from_output(self, raw: dict[str, Any], context: ScannerContext) -> list[dict[str, Any]]:
+        return []
+
+    def additional_artifacts(self, raw: dict[str, Any], context: ScannerContext) -> dict[str, Any]:
+        return {"posture": normalize_scorecard(raw, context.workspace, git_remote(context.workspace), os.environ.get("SECURITY_SCAN_REPOSITORY_COMMIT"))}
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return ["scorecard", f"--local={context.workspace}", "--format=json"]
+
+    def process_environment(self, context: ScannerContext) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(context.workspace),
+        })
+        return environment
+
+
+class GitleaksScanner(Scanner):
+    name = "gitleaks"
+    output_name = "gitleaks"
+    version_command = ["gitleaks", "version"]
+    accepts_list_output = True
+
+    def _git_dir(self, workspace: Path) -> Path | None:
+        dot_git = workspace / ".git"
+        if dot_git.is_dir():
+            return dot_git
+        if dot_git.is_file():
+            try:
+                prefix, value = dot_git.read_text(encoding="utf-8").split(":", 1)
+                if prefix.strip().casefold() != "gitdir":
+                    return None
+                candidate = Path(value.strip())
+                return candidate if candidate.is_absolute() else (workspace / candidate).resolve()
+            except (OSError, UnicodeError, ValueError):
+                return None
+        return None
+
+    def _history_state(self, workspace: Path) -> tuple[bool, str]:
+        git_dir = self._git_dir(workspace)
+        if git_dir is None:
+            return False, "unavailable"
+        shallow = git_dir / "shallow"
+        return True, "shallow" if shallow.is_file() else "complete"
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return os.environ.get("SECURITY_SCAN_INCLUDE_GIT", "").casefold() == "true" and self._git_dir(context.workspace) is not None
+
+    def not_applicable_result(self, context: ScannerContext) -> tuple[str, str, str, dict[str, Any]]:
+        available, history = self._history_state(context.workspace)
+        if os.environ.get("SECURITY_SCAN_INCLUDE_GIT", "").casefold() != "true":
+            return (
+                "not_applicable", "git_history_not_requested",
+                "Gitleaks Git-history scanning is disabled unless --include-git is explicitly requested.",
+                {"assessment": "not_applicable", "historyMode": "full", "repositoryHistory": "not_requested", "gitRepositoryAvailable": available},
+            )
+        return (
+            "not_applicable", "git_repository_unavailable",
+            "Gitleaks Git-history scanning requires a repository with .git metadata; the workspace did not contain one.",
+            {"assessment": "not_applicable", "historyMode": "full", "repositoryHistory": "unavailable", "gitRepositoryAvailable": False},
+        )
+
+    def initial_coverage(self, context: ScannerContext) -> dict[str, Any]:
+        available, history = self._history_state(context.workspace)
+        return {
+            "assessment": "unknown",
+            "historyMode": "full",
+            "repositoryHistory": history,
+            "gitRepositoryAvailable": available,
+            "targetCounts": {"attempted": 1, "completed": 0, "failed": 0},
+        }
+
+    def validate_schema(self, raw: Any) -> str:
+        if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+            raise ValueError("scanner output schema is unsupported (expected Gitleaks JSON findings array)")
+        return self._version()
+
+    def coverage_from_output(self, raw: Any, context: ScannerContext) -> dict[str, Any]:
+        _, history = self._history_state(context.workspace)
+        assessment = "partial" if history == "shallow" else "complete" if history == "complete" else "unknown"
+        return {
+            "assessment": assessment,
+            "historyMode": "full",
+            "repositoryHistory": history,
+            "gitRepositoryAvailable": True,
+            "targetCounts": {"attempted": 1, "completed": 1, "failed": 0},
+            "findingCount": len(raw),
+        }
+
+    def findings_from_output(self, raw: Any, context: ScannerContext) -> list[dict[str, Any]]:
+        return normalize_gitleaks(raw)
+
+    def sanitize_output(self, raw: Any) -> Any:
+        return _sanitize_gitleaks(raw)
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return [
+            "gitleaks", "git", str(context.workspace), "--redact",
+            "--log-opts=--all",
+            "--no-banner", "--report-format", "json", "--report-path", "-", "--exit-code", "1",
+        ]
+
+    def process_environment(self, context: ScannerContext) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": str(context.workspace),
+        })
+        return environment
+
+
+def _run_process(command: list[str], cwd: Path, timeout: int, environment: dict[str, str] | None = None) -> tuple[str, str, int]:
     process = subprocess.Popen(
         command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=environment,
         start_new_session=(os.name != "nt"),
     )
     try:
@@ -683,6 +856,22 @@ def sanitize_data(value: Any, secret_context: bool = False) -> Any:
         return output
     if isinstance(value, list):
         return [sanitize_data(item, secret_context) for item in value]
+    if isinstance(value, str):
+        return _safe_text(value)
+    return value
+
+
+def _sanitize_gitleaks(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if str(key).casefold() in {"match", "secret", "linecontent", "fragment", "diff", "fingerprint"}:
+                result[str(key)] = "[REDACTED]" if item is not None else None
+            else:
+                result[str(key)] = _sanitize_gitleaks(item)
+        return result
+    if isinstance(value, list):
+        return [_sanitize_gitleaks(item) for item in value]
     if isinstance(value, str):
         return _safe_text(value)
     return value

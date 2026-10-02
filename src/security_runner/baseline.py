@@ -21,7 +21,7 @@ SEVERITY_WEIGHT = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "
 SCANNERS_BY_CAPABILITY = {
     "dependency": {"osv-scanner", "trivy", "grype"},
     "sast": {"semgrep"},
-    "secret": {"trivy"},
+    "secret": {"trivy", "gitleaks"},
     "container": {"trivy"},
     "iac": {"trivy"},
 }
@@ -523,6 +523,7 @@ def _baseline_finding(finding: dict[str, Any], remediation: dict[str, Any] | Non
         "package": minimal_package,
         "semanticState": semantic_state,
         "detectors": detectors,
+        **({"historical": True} if (finding.get("secretEvidence") or {}).get("scope") == "historical" else {}),
     }
 
 
@@ -556,6 +557,19 @@ def _resolution_evidence(finding: dict[str, Any], scanners: list[dict[str, Any]]
         if any(scanner.get("coverage", {}).get("assessment") == "unknown" for scanner in relevant if scanner.get("name") == "trivy"):
             return "coverage_unknown", None
         return "target_not_covered", None
+
+    if capability == "secret" and finding.get("historical"):
+        gitleaks = next((scanner for scanner in relevant if scanner.get("name") == "gitleaks"), None)
+        if gitleaks is None or gitleaks.get("status") in {"failed", "timeout"}:
+            return "scanner_failed" if gitleaks else "capability_not_executed", None
+        if gitleaks.get("status") in {"not_applicable", "skipped", "unsupported_manifest"}:
+            return "capability_not_executed", None
+        coverage = gitleaks.get("coverage") or {}
+        if coverage.get("repositoryHistory") == "shallow" or coverage.get("assessment") != "complete":
+            return "coverage_unknown", None
+        if coverage.get("repositoryHistory") != "complete":
+            return "coverage_unknown", None
+        return None, {"scanner": "gitleaks", "target": target, "state": "history_complete"}
 
     scanner_name = "semgrep" if capability == "sast" else "trivy"
     scanner = next((item for item in relevant if item.get("name") == scanner_name), None)
@@ -634,7 +648,8 @@ def _remediations_by_finding(remediations: list[dict[str, Any]]) -> dict[str, di
 def _baseline_display(finding: dict[str, Any]) -> dict[str, Any]:
     return {
         key: finding[key]
-        for key in ("fingerprint", "title", "severity", "category", "capability", "target", "identifiers", "package", "semanticState")
+        for key in ("fingerprint", "title", "severity", "category", "capability", "target", "identifiers", "package", "semanticState", "historical")
+        if key in finding
     }
 
 

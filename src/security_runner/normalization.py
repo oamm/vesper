@@ -28,7 +28,44 @@ def normalize(scanner: str, raw: Any) -> list[dict[str, Any]]:
         return _normalize_semgrep(raw)
     if scanner == "grype":
         return _normalize_grype(raw)
+    if scanner == "gitleaks":
+        return normalize_gitleaks(raw)
     return []
+
+
+def normalize_gitleaks(raw: Any) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for leak in raw if isinstance(raw, list) else []:
+        if not isinstance(leak, dict):
+            continue
+        rule_id = leak.get("RuleID") or "secret"
+        path = _normalize_file_path(leak.get("File") or leak.get("SymlinkFile") or "")
+        commit = str(leak.get("Commit") or "").strip()
+        line = _line(leak, "StartLine")
+        title = leak.get("Description") or rule_id
+        safe_description = "Secret detected in Git history; rotate or revoke the credential and remove the historical exposure."
+        finding = _finding(
+            "secret", rule_id, title, safe_description, "unknown", "gitleaks", rule_id,
+            path, line, _line(leak, "StartColumn"), [], [], None, None,
+            "Historical Git secret evidence", rule_id, identity_extra=commit,
+        )
+        finding["secretEvidence"] = {
+            "scope": "historical",
+            "currentPresence": "unknown",
+            "commit": _safe_text(commit) if commit else None,
+            "rule": _safe_text(rule_id),
+        }
+        finding["location"]["history"] = True
+        finding["scannerEvidence"][0].update({
+            "historical": True,
+            "commit": _safe_text(commit) if commit else None,
+            "date": _safe_text(leak.get("Date") or "") or None,
+            "nativeRule": _safe_text(rule_id),
+            "nativeFile": path,
+            "nativeLine": line,
+        })
+        findings.append(finding)
+    return findings
 
 
 def normalize_grype(raw: Any, inventory: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -234,7 +271,7 @@ def _normalize_semgrep(raw: Any) -> list[dict[str, Any]]:
 def _finding(category: str, finding_type: Any, title: Any, description: Any, severity: Any,
              scanner: str, rule_id: Any, path: Any, line: Any, column: Any, cwe: Any,
              cve: Any, cvss: Any, package: Any, evidence: Any, raw_id: Any,
-             confidence: Any = "unknown") -> dict[str, Any]:
+             confidence: Any = "unknown", identity_extra: Any = None) -> dict[str, Any]:
     normalized_severity = normalize_severity(severity)
     type_value = _safe_text(finding_type or category)
     cwe_list = cwe if isinstance(cwe, list) else [cwe] if cwe else []
@@ -243,6 +280,8 @@ def _finding(category: str, finding_type: Any, title: Any, description: Any, sev
     package_value = package if isinstance(package, dict) and package.get("name") else None
     identity_key = sorted(str(value).casefold() for value in cve_list)[0] if cve_list else type_value.casefold()
     components = [category, identity_key, location_file, str(line or "")]
+    if identity_extra:
+        components.append(str(identity_extra))
     if package_value:
         components.extend([
             str(package_value.get("ecosystem") or "unknown").casefold(),

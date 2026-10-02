@@ -17,6 +17,8 @@ timeouts:
   sast: 600
   syft: 600
   grype: 600
+  gitleaks: 600
+  scorecard: 600
 
 scanner:
   trivy:
@@ -28,4 +30,8 @@ scanner:
   syft:
     enabled: true
   grype:
+    enabled: true
+  gitleaks:
+    enabled: true
+  scorecard:
     enabled: true
