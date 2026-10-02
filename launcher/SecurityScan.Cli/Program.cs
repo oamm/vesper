@@ -254,7 +254,7 @@ internal static class Program
 
     private static int RunReportCommand(string command, string? requestedPath)
     {
-        var reportDirectory = FindReportDirectory(requestedPath ?? "security-results");
+        var reportDirectory = ScanReportLocator.FindLatest(requestedPath ?? "security-results");
         if (reportDirectory is null)
         {
             Console.Error.WriteLine("[report] No completed Vesper scan was found. Provide an output directory.");
@@ -295,20 +295,4 @@ internal static class Program
         return 0;
     }
 
-    private static string? FindReportDirectory(string requestedPath)
-    {
-        var path = Path.GetFullPath(requestedPath);
-        if (File.Exists(Path.Combine(path, "summary.json")))
-        {
-            return path;
-        }
-        if (!Directory.Exists(path))
-        {
-            return null;
-        }
-        return Directory.EnumerateDirectories(path)
-            .Where(directory => File.Exists(Path.Combine(directory, "summary.json")))
-            .OrderByDescending(directory => Directory.GetLastWriteTimeUtc(directory))
-            .FirstOrDefault();
-    }
 }

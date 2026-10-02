@@ -63,6 +63,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         var stats = WorkspaceArchive.Measure(workspace, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits);
 
         Console.WriteLine("Vesper Security Scan");
+        Console.WriteLine($"Started at (UTC): {execution.StartedAtText}");
         Console.WriteLine($"Docker context: {environment.Context}");
         Console.WriteLine($"Docker endpoint: {DockerEndpointClassifier.SanitizeForDisplay(environment.Endpoint)}");
         Console.WriteLine($"Workspace mode: {mode.ToString().ToLowerInvariant()}");
@@ -415,6 +416,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         arguments.AddRange(execution.Labels("runner"));
         arguments.AddRange([
             "--env", $"SECURITY_SCAN_ID={execution.ScanIdText}",
+            "--env", $"SECURITY_SCAN_STARTED_AT={execution.StartedAtText}",
             "--read-only", "--tmpfs", "/tmp",
             "--security-opt=no-new-privileges", "--cap-drop=ALL",
             $"--cpus={options.ResourceLimits.Cpus}",

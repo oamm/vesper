@@ -1,7 +1,10 @@
+using System.Globalization;
+
 namespace Vesper.Cli;
 
 public sealed record ScanExecutionContext(
     Guid ScanId,
+    DateTimeOffset StartedAt,
     string DockerContext,
     string SourcePath,
     string OutputRootPath,
@@ -15,6 +18,7 @@ public sealed record ScanExecutionContext(
 {
     public string ScanIdText => ScanId.ToString("D");
     public string ShortId => ScanId.ToString("N")[..12];
+    public string StartedAtText => StartedAt.ToString("O", CultureInfo.InvariantCulture);
 
     public static ScanExecutionContext Create(
         string sourcePath,
@@ -22,9 +26,11 @@ public sealed record ScanExecutionContext(
         bool useVolumes,
         bool hasConfig,
         Guid? scanId = null,
-        string dockerContext = "default")
+        string dockerContext = "default",
+        DateTimeOffset? startedAt = null)
     {
         var id = scanId ?? Guid.NewGuid();
+        var executionStartedAt = (startedAt ?? DateTimeOffset.UtcNow).ToUniversalTime();
         var shortId = id.ToString("N")[..12];
         var projectName = SanitizeProjectName(Path.GetFileName(Path.TrimEndingDirectorySeparator(sourcePath)));
         var sourceFullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourcePath));
@@ -34,12 +40,15 @@ public sealed record ScanExecutionContext(
         var outputExclusion = outputFullPath.StartsWith(sourcePrefix, comparison)
             ? Path.GetRelativePath(sourceFullPath, outputFullPath).Replace('\\', '/')
             : null;
+        var dateDirectory = executionStartedAt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        var timeDirectory = $"{executionStartedAt.ToString("HH-mm-ss", CultureInfo.InvariantCulture)}_{shortId}";
         return new ScanExecutionContext(
             id,
+            executionStartedAt,
             dockerContext,
             sourceFullPath,
             outputFullPath,
-            Path.Combine(outputFullPath, id.ToString("N")),
+            Path.Combine(outputFullPath, dateDirectory, timeDirectory),
             outputExclusion,
             $"vesper-{shortId}",
             projectName,

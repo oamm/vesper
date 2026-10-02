@@ -36,6 +36,8 @@ var tests = new (string Name, Action Run)[]
     ("Docker daemon disconnect classification", DockerDaemonDisconnectClassification),
     ("workspace mode selection", WorkspaceModeSelection),
     ("unique scan execution identities", UniqueScanExecutionIdentities),
+    ("date-grouped scan output paths", DateGroupedOutputPaths),
+    ("legacy and date-grouped report lookup", LegacyAndDateGroupedReportLookup),
     ("resource limit validation", ResourceLimitValidation),
     ("workspace transfer limit validation", WorkspaceTransferLimitValidation),
     ("Windows mount arguments", WindowsMountArguments),
@@ -631,4 +633,48 @@ static void DockerDaemonDisconnectClassification()
     Check(result.ExitCode == 125, "a disconnected Docker CLI must retain a non-zero command status");
     Check(result.StandardError.Contains("controlled disconnect", StringComparison.Ordinal), "Docker disconnect details should remain available to the caller");
     Check(ScannerExitPolicy.AfterExport(2, exportSucceeded: false) == 2, "a disconnect or failed export must never pass the gate");
+}
+
+static void DateGroupedOutputPaths()
+{
+    var outputRoot = Path.Combine(Path.GetTempPath(), "date-grouped-output");
+    var projectPath = Path.Combine(Path.GetTempPath(), "same-second-project");
+    var startedAt = new DateTimeOffset(2026, 10, 1, 13, 42, 18, TimeSpan.Zero);
+    var firstId = Guid.Parse("a8f55dfc-a41a-4c28-9808-990706ef8a22");
+    var secondId = Guid.Parse("b761bdc9-a41a-4c28-9808-990706ef8a22");
+    var first = ScanExecutionContext.Create(projectPath, outputRoot, useVolumes: false, hasConfig: false, firstId, startedAt: startedAt);
+    var second = ScanExecutionContext.Create(projectPath, outputRoot, useVolumes: false, hasConfig: false, secondId, startedAt: startedAt);
+    var dateDirectory = Path.Combine(outputRoot, "2026-10-01");
+
+    Check(first.StartedAt == startedAt && second.StartedAt == startedAt, "the context must retain its single UTC execution timestamp");
+    Check(Path.GetDirectoryName(first.OutputPath) == dateDirectory, "execution date should be the primary result grouping");
+    Check(Path.GetFileName(first.OutputPath) == $"13-42-18_{first.ShortId}", "result directory should include captured time and short scan ID");
+    Check(Path.GetDirectoryName(second.OutputPath) == dateDirectory, "same-day executions should share the date directory");
+    Check(Path.GetFileName(second.OutputPath) == $"13-42-18_{second.ShortId}", "same-second executions should retain distinct short IDs");
+    Check(first.OutputPath != second.OutputPath, "different full scan IDs must not collide within the same second");
+    Check(first.ScanIdText == firstId.ToString("D"), "the full scan ID remains the authoritative identity");
+}
+
+static void LegacyAndDateGroupedReportLookup()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"vesper-report-layout-{Guid.NewGuid():N}");
+    var legacy = Path.Combine(root, "a8f55dfca41a4c28980990706ef8a22");
+    var dateGrouped = Path.Combine(root, "2026-10-01", "13-42-18_b761bdc9");
+    Directory.CreateDirectory(legacy);
+    Directory.CreateDirectory(dateGrouped);
+    try
+    {
+        File.WriteAllText(Path.Combine(legacy, "summary.json"), "{}", System.Text.Encoding.UTF8);
+        File.WriteAllText(Path.Combine(legacy, "scan.json"), "{\"startedAt\":\"2026-10-01T12:00:00+00:00\"}", System.Text.Encoding.UTF8);
+        File.WriteAllText(Path.Combine(dateGrouped, "summary.json"), "{}", System.Text.Encoding.UTF8);
+        File.WriteAllText(Path.Combine(dateGrouped, "scan.json"), "{\"startedAt\":\"2026-10-01T13:42:18+00:00\"}", System.Text.Encoding.UTF8);
+
+        Check(ScanReportLocator.FindLatest(root) == dateGrouped, "report lookup should select the latest metadata timestamp across legacy and date-grouped layouts");
+        Check(ScanReportLocator.FindLatest(legacy) == legacy, "an explicit legacy scan directory should remain readable");
+        Check(ScanReportLocator.FindLatest(Path.GetDirectoryName(dateGrouped)!) == dateGrouped, "a date directory should resolve to its latest scan");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
 }
