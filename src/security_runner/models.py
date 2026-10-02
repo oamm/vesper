@@ -57,6 +57,7 @@ class ScannerContext:
     project: Project
     timeout_seconds: int
     exclude_paths: list[str] = field(default_factory=list)
+    exclude_files: list[str] = field(default_factory=list)
 
 
 @dataclass

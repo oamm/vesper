@@ -31,8 +31,13 @@ TECH_ORDER = [
 ]
 
 
-def detect_project(root: Path, exclude_paths: set[str] | None = None) -> Project:
+def detect_project(
+    root: Path,
+    exclude_paths: set[str] | None = None,
+    exclude_files: set[str] | None = None,
+) -> Project:
     excluded_paths = {path.strip("/") for path in (exclude_paths or set()) if path.strip("/")}
+    excluded_files = {path.replace("\\", "/").strip("/") for path in (exclude_files or set()) if path.strip("/\\")}
     files: list[Path] = []
     exclusions: dict[str, str] = {}
     for current, dirs, filenames in os.walk(root, followlinks=False):
@@ -50,6 +55,10 @@ def detect_project(root: Path, exclude_paths: set[str] | None = None) -> Project
         dirs[:] = sorted(kept_directories)
         for filename in filenames:
             path = Path(current, filename)
+            relative_file = f"{relative_current}/{filename}".strip("/")
+            if relative_file in excluded_files:
+                exclusions[relative_file] = "baseline_input"
+                continue
             try:
                 if path.is_file():
                     files.append(path)

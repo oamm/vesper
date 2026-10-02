@@ -1,8 +1,8 @@
 # Vesper Product Status
 
-**Last updated:** 2026-10-01
+**Last updated:** 2026-10-02
 **Current version:** 0.2.0
-**Current milestone:** M2 - Baseline and Finding Diff
+**Current milestone:** M2 - Baseline and Finding Diff (COMPLETE)
 **Overall status:** IN PROGRESS
 
 ## Product Goal
@@ -35,7 +35,7 @@ Developer / CI
 - Docker endpoint classification supports npipe, Unix socket, SSH, loopback and remote TCP/HTTP(S); Docker calls are pinned to the context/host selected at scan start.
 - Local bind and remote volume workspace modes; source archives exclude common generated directories and enforce byte/file/per-file ceilings.
 - Scan-specific report directories, labeled Docker resources, bounded Docker operation timeouts, runner limits, fail-closed execution completeness, and per-scan cleanup.
-- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts; `comparison.json` is reserved for requested baseline comparisons.
+- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts. A completed scan can create a versioned `baseline.json`; scans with a baseline emit a separate `comparison.json` without mutating current findings.
 - Scanner execution status is separate from coverage assessment and policy gate; `unsupported_manifest` is explicit and cannot be treated as clean. Reports use schema v2 and validate internal totals/references before writing final JSON.
 
 ## Milestones
@@ -65,7 +65,6 @@ Developer / CI
 
 #### Remaining / deferred
 
-- Exact Lynx baseline regression is unavailable because its raw scan outputs are not in this checkout.
 - Database/rule caches and additional scanners are deferred.
 
 #### Exit criteria
@@ -197,7 +196,7 @@ Developer / CI
 
 ### M2 - Baseline and Finding Diff
 
-**Status:** IN PROGRESS
+**Status:** COMPLETE
 
 **Goal:** Distinguish new, existing, changed, and resolved findings without losing raw findings or scanner evidence.
 
@@ -209,29 +208,27 @@ Developer / CI
 
 - Database/history service, hosted orchestration, or automatic remediation.
 
-#### In Progress
+#### Completed
 
-- New scan results are grouped by UTC execution date and time with a short scan-ID suffix. The full `scanId` remains authoritative in `scan.json`.
-- One UTC `DateTimeOffset` is captured in `ScanExecutionContext` and reused for the result path, launcher/runner start logs, and `scan.json`; `finishedAt` and `durationMs` are persisted with it.
-- `vesper report` and `vesper gate` read both date-grouped results and legacy `<scan-id>/` results without migrating old output.
-- The Windows PowerShell wrapper uses the published Native AOT CLI only when it is no older than CLI source/build-property inputs; stale or absent binaries fall back to `dotnet run`.
-- Baseline comparison and `comparison.json` generation are not implemented yet; ordinary scans do not create `comparison.json`. When added, comparison metadata must reuse `scanId` and `startedAt` from `scan.json`, not generate another timestamp.
-- Report schema v2 marks `project.json`, `scan.json`, and `summary.json`; findings/remediations remain arrays with per-item schema markers and a schema manifest in `scan.json`. Finding totals, severity counts, and category counts appear only under `summary.json.findings`; redundant top-level aliases and the derived category/severity matrix are omitted.
-- Project inventory reports artifact aggregates and excluded transient/output paths. Findings preserve native scanner titles/descriptions/IDs separately from package-aware normalized titles, confidence/applicability/reachability, finding nature, and contextual hardening metadata.
-- Project descriptors, dependency manifests, scanner inputs, and project associations are separate. .NET projects associate only same-directory `packages.lock.json`/`packages.config` or matching descendant `<ProjectName>.deps.json`; solution files are project inventory, not dependency manifests.
-- OSV invokes one process with repeated explicit `--lockfile` targets. `scan.json` records attempted/completed/failed targets and finding counts independently of vulnerability-result sources; `summary.json` carries only aggregate target counts. OSV 2.3.3's exact per-target failure granularity is process-wide, so a failed batched invocation marks every submitted target failed.
-- Scanner-neutral capabilities aggregate detector assessments. OSV reports supported targets; Trivy coverage remains unknown when its JSON cannot prove zero-result targets or capability-specific coverage. Semgrep exposes attempted versus successfully parsed source files, parse-error paths/types, skipped paths when present, and rule counts only if emitted. Complete requires scanned/skipped lists, no reported errors/skipped rules, and a positive loaded-rule count; the pinned JSON omits that count.
-- Coverage warnings are compact counts with details in `project.json`/`scan.json`, not hundreds of repeated paths in `summary.json`.
-- Fixed-version recommendations are semantic-version checked, never downgrade, and select only a common compatible fix line that resolves every grouped advisory; all native candidates and the selection rationale remain in remediation output.
-- Before writing final JSON artifacts, report invariants validate canonical finding counts, scanner provenance bounds, remediation references/files/identifiers, gate blocker references, and schema markers.
+- New scans use UTC date/time result directories and saved reports remain readable across legacy and date-grouped layouts.
+- Baseline schema v1 is created only from completed schema-v2 report sets; a failed security gate does not disqualify existing security debt. Baselines validate their metadata, identity version, duplicate identities, target paths, coverage structure, and deterministic content digest.
+- Existing finding fingerprints remain `fingerprintVersion: 2`. Baseline `identityVersion: 1` is scanner-neutral and matches by semantic identifier candidates. Dependency identity uses capability, project-relative target, ecosystem, package, and canonical vulnerability ID; SAST/config identity uses capability, target, rule, and line. Severity, installed version, and recommended version are material state fields; detector set, added aliases, native prose, timestamps, and execution order are not.
+- `comparison.json` is emitted only with `--baseline` and reports `new`, `existing`, `changed`, `resolved`, and `unverified` without mutating `findings.json`. Output ordering is deterministic and resolved/unverified entries preserve minimal baseline evidence.
+- Resolution requires positive capability/target evidence. Completed OSV targets and fully evidenced Semgrep target/rule coverage can prove resolution. Failed/uncovered OSV targets, Semgrep parse errors or unknown rule coverage, and Trivy's current unknown zero-result coverage remain `unverified`.
+- `baseline.failOnNew` defaults to critical/high and combines with the existing absolute policy. Baseline creation uses `python -m security_runner.baseline_cli create <scan-result-dir> --output baseline.json`; `vesper scan --baseline` stages the artifact read-only, and `vesper report`/`vesper gate` validate saved comparison artifacts.
+- The Windows PowerShell wrapper uses Native AOT only when the binary is at least as recent as CLI source/build inputs; a stale or absent publish falls back to `dotnet run`.
+- Report schema v2 keeps finding totals only under `summary.json.findings`; redundant aliases and the derived matrix are omitted. Project inventory, OSV explicit target states, Semgrep analyzed files/parse errors, Trivy unknown assessments, capability coverage, multi-scanner provenance, and cross-artifact validation remain intact.
+- Project descriptors, dependency manifests, and scanner inputs remain separate; fixed-version selection never downgrades and recommends only a common compatible fix line.
 
 #### Audit Evidence
 
 - The `Dast` self-scan has two `.csproj` descriptors and no associated NuGet lockfiles; it also contains a fixture `package-lock.json` with a sibling `package.json`. OSV 2.3.3 documents NuGet lockfiles/config/deps.json and npm package-lock; project descriptor association must not mistake a `.csproj` for the scanner input.
 - Semgrep 1.99.0 reported 39 paths, including 12 C# files; Vesper matched 21 detected source candidates, observed one `PartialParsing` error for `Dockerfile`, and reported partial coverage. The nested Semgrep error type is normalized to its leading type name, and the bounded message is preserved. Skipped-path count was omitted because output did not provide it. Its JSON does not report rules loaded, so `rulesLoaded` remains unknown and clean execution is not presented as complete coverage.
-- A no-cache runner image build completed and embedded-source SHA-256 values matched the workspace for `runner.py` and `scanners.py`. Remote self-scan `f47bd9ed-303e-4a34-8fbb-fb99d921c3d7` emitted schema-v2 reports, an 8-artifact inventory, 38 findings, and 36 remediations; all report invariants passed. OSV attempted and completed its one supported lockfile target and reported two unsupported .NET project descriptors. The configured gate returned 1 as expected. A synthetic regression preserves 25 DS026 findings individually and groups them into one contextual hardening remediation.
+- Synthetic tests cover deterministic baseline creation, malformed/incomplete rejection, all five states, alias/detector stability, Windows/Linux path normalization, OSV success/failure, Semgrep successful/parse-error coverage, Trivy unknown coverage, existing-debt pass, new-high fail, new-low pass, changed severity, saved gate reproduction, and corrupted artifacts failing with exit 2.
+- Real Lynx unchanged-baseline regression: initial completed scan had 31 findings / 5 remediations; final scan `f02d0198-2ac2-4505-a2e1-1f8c2b46564c` also had 31 / 5. `comparison.json` recorded `new=0`, `existing=31`, `changed=0`, `resolved=0`, `unverified=0`; baseline-aware gate passed. The exported saved report displayed the counts, and saved `vesper gate` reproduced PASS. Lynx remained unmodified.
+- The final runner image was built without cache and embedded-source SHA-256 values matched the workspace for all seven changed Python modules. The final Lynx scan used 3 scanners; OSV coverage completed, Semgrep reported 24 parse errors (so its coverage remains partial), and Trivy coverage remains unknown. No resolution was inferred from those partial/unknown assessments.
 - That scan's 8 report files total 236,459 bytes; `summary.json` is 4,539 bytes. Reconstructing the removed aliases and category/severity matrix from the same data adds 552 bytes (16%) to compact-serialized summary JSON. No pre-change report bundle is retained in `security-results`, so an exact historical bundle-size comparison is unavailable.
-- The Windows Native AOT publish could not be refreshed on this host because the Visual C++ desktop workload/linker is unavailable. The checked-in local executable is older than current CLI source; `vesper.ps1 report` and `vesper.ps1 gate` were verified through the source fallback against the fresh report. The published AOT artifact remains UNVERIFIED until rebuilt on a host with the required linker.
+- The Windows Native AOT publish could not be refreshed on this host because the Visual C++ desktop workload/linker is unavailable. The checked-in local executable is older than current CLI source; source fallback for `report`/`gate` and source-built .NET tests pass. The published AOT artifact remains UNVERIFIED; this does not block the Python baseline runner or M2 acceptance.
 - The live minimist finding at 0.0.8 selects 0.2.4 as the highest common patch threshold on its 0.x minor line while preserving other candidates. Regression cases verify `System.Text.Json` 8.0.4 chooses 8.0.5 over 6.0.10, downgrade refusal, and no common target across disjoint branches.
 
 #### Acceptance criteria
@@ -241,9 +238,12 @@ Developer / CI
 - [x] Supported OSV manifests are distinguished from unsupported project descriptors; Semgrep coverage is based on observed file/error/rule metrics and never claims complete when loaded-rule count is unavailable.
 - [x] Dependency scanners record submitted target states independently from findings; detailed target paths stay out of summary aggregates.
 - [x] HEALTHCHECK and dependency reports preserve individual evidence while grouping shared fixes and documenting priority rationale.
-- [ ] Baseline creation and comparison are deterministic.
-- [ ] Findings retain audit evidence; status changes do not alter finding identity.
-- [ ] New-finding gate behavior has focused tests.
+- [x] Versioned deterministic baseline creation rejects incomplete/corrupt/unsupported reports; a completed failed-gate scan remains eligible.
+- [x] Versioned scanner-neutral finding identity preserves `fingerprintVersion: 2`; identity/status changes retain current evidence.
+- [x] Deterministic `NEW`/`EXISTING`/`CHANGED`/`RESOLVED`/`UNVERIFIED` comparisons preserve separate `comparison.json` and `findings.json` artifacts.
+- [x] Coverage-aware resolution requires capability/target success; OSV, Semgrep parse failures, Trivy unknown coverage, unsupported coverage, and incomplete executions are conservative.
+- [x] New-only gate, saved `vesper report`/`vesper gate`, fail-closed comparison validation, and report consistency have regression coverage.
+- [x] Synthetic integration matrix and real Lynx unchanged-baseline regression passed with `NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`.
 
 ---
 
@@ -261,11 +261,41 @@ Developer / CI
 
 ---
 
-### M4 - DAST and M5 - Centralized Orchestration
+### M4 - Artifact & Supply Chain Security
+
+**Status:** PLANNED
+
+SBOM ingestion, artifact inventory, and deterministic supply-chain policy.
+
+### M5 - API Security & Fuzzing
+
+**Status:** PLANNED
+
+API contract analysis and controlled fuzzing integrations.
+
+### M6 - DAST & Runtime Security
+
+**Status:** PLANNED
+
+Dynamic application testing and runtime security evidence.
+
+### M7 - Infrastructure & Kubernetes Security
+
+**Status:** PLANNED
+
+Infrastructure and Kubernetes-specific policy and coverage.
+
+### M8 - Deterministic Evidence Correlation
+
+**Status:** PLANNED
+
+Cross-source evidence correlation that preserves deterministic, auditable findings.
+
+### M9 - Centralized Orchestration
 
 **Status:** DEFERRED
 
-DAST (including ZAP/Nuclei), hosted APIs/UI, databases, queues, Kubernetes Jobs, distributed workers, SaaS execution, and shared caches are not implemented or scheduled in M1. Revisit only after M1.3 and CI readiness.
+Hosted APIs/UI, databases, queues, distributed workers, SaaS execution, shared caches, and centralized scheduling remain deferred.
 
 ## Security Findings
 
@@ -320,7 +350,6 @@ DAST (including ZAP/Nuclei), hosted APIs/UI, databases, queues, Kubernetes Jobs,
 - No CI pipeline, standard .NET test framework, or automated cross-platform AOT matrix exists.
 - Actual daemon loss after resource creation is unverified; cleanup remains best-effort while the endpoint is unreachable.
 - macOS Native AOT/filesystem behavior and local Docker Desktop bind-mode acceptance are unverified.
-- The true Lynx raw scan report is absent; its stated 31 findings / 5 remediations remains UNVERIFIED.
 
 ## Known Limitations
 
@@ -332,12 +361,12 @@ DAST (including ZAP/Nuclei), hosted APIs/UI, databases, queues, Kubernetes Jobs,
 
 ## Deferred Work
 
-- Baseline/diff (M2), CI-provider workflows (M3), DAST, additional scanners, SBOM product features, shared scanner caches, orphan cleanup command, Kubernetes Jobs, centralized workers, SaaS/API/UI, and AI remediation.
+- CI-provider workflows (M3), future M4-M9 capabilities, additional scanners, shared scanner caches, orphan cleanup command, and hosted execution remain future work.
 - A Vesper release-image SBOM may be added as supply-chain metadata; no SBOM ingestion platform is planned here.
 
 ## Not Implemented Yet
 
-- DAST, OWASP ZAP, Nuclei, web UI, REST API, PostgreSQL, Redis/queues, Kubernetes Jobs, hosted multi-user service, GitHub/GitLab integrations, baseline/diff, AI remediation, and distributed workers.
+- CI-provider integrations, artifact/SBOM workflows, API fuzzing, DAST, runtime security, expanded infrastructure/Kubernetes analysis, centralized evidence correlation, hosted APIs/UI, databases/queues, and distributed workers.
 
 ## Product Readiness
 
@@ -353,7 +382,7 @@ DAST (including ZAP/Nuclei), hosted APIs/UI, databases, queues, Kubernetes Jobs,
 
 1. Keep macOS runtime/AOT and actual daemon-disappearance verification as explicit platform/environment validation work.
 2. Make M3 publish the runner manifest digest and CLI together; the default local development tag remains versioned for usability.
-3. Run the real Lynx reports as a non-hardcoded regression fixture before planning M2 baseline/diff.
+3. Keep Windows AOT republishing on a suitable linker-equipped host as environment verification; M3 remains planned and has not started.
 
 ## Future Development Workflow
 
@@ -373,4 +402,7 @@ DAST (including ZAP/Nuclei), hosted APIs/UI, databases, queues, Kubernetes Jobs,
 - Documented M2 baseline/diff as the next product milestone and recorded CI, DAST, and hosted execution as later/not implemented.
 - Reverified the empty-scan indeterminate exit, read-only workspace, same/different-project concurrency, and current-tree self-scan with the final AOT binary/image.
 - Completed M1.3 after Linux filesystem/AOT/signal integration, scanner-envelope and network-failure tests, archive-entry/metadata bounds, and hash-enforced runner build verification. A final dangling-symlink review added direct attribute checks and Linux regression cases before completion. macOS and real daemon-loss behavior remain explicitly UNVERIFIED; runner digest enforcement is accepted for M3 release work.
-- Started the M2 result-organization slice: new results use one captured UTC timestamp for date/time grouping and scan metadata; legacy report lookup remains supported. Baseline comparison is still unimplemented.
+
+### 2026-10-02
+
+- Completed M2 baseline creation, semantic identity, all five comparison states, coverage-aware resolution, new-only gate, saved-report reproduction, 58 passing Python tests, passing launcher tests, and the real Lynx unchanged-baseline regression (`NEW=0`, `EXISTING=31`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`). M3 remains planned and has not started.

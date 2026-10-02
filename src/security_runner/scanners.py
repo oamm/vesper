@@ -234,12 +234,15 @@ class TrivyScanner(Scanner):
     def command(self, context: ScannerContext) -> list[str]:
         skipped_dirs = [".git", "node_modules", "bin", "obj", "dist", "build", "artifacts", "coverage", "target", "security-results"]
         skipped_dirs.extend(path for path in context.exclude_paths if path not in skipped_dirs)
-        return [
+        command = [
             "trivy", "fs", "--quiet", "--no-progress", "--format", "json",
             "--scanners", "vuln,misconfig,secret",
             "--skip-dirs", ",".join(skipped_dirs),
             "--timeout", f"{context.timeout_seconds}s", str(context.workspace),
         ]
+        if context.exclude_files:
+            command.extend(["--skip-files", ",".join(context.exclude_files)])
+        return command
 
 
 class OsvScanner(Scanner):
@@ -458,6 +461,7 @@ class SastScanner(Scanner):
             "filesDiscovered": len(context.project.source_files),
             "attemptedFiles": len(scanned_sources),
             "filesAnalyzed": len(successfully_parsed),
+            "analyzedFiles": sorted(successfully_parsed),
             "parseErrorFiles": sorted(parse_error_files, key=lambda item: (item["path"], item["type"])),
             "pathsReportedScanned": len(scanned) if isinstance(scanned, list) else None,
             "csharpFilesDiscovered": sum(path.casefold().endswith(".cs") for path in context.project.source_files),
@@ -490,6 +494,8 @@ class SastScanner(Scanner):
             "--exclude", "artifacts", "--exclude", "coverage", "--exclude", "security-results",
         ]
         for path in context.exclude_paths:
+            command.extend(["--exclude", path])
+        for path in context.exclude_files:
             command.extend(["--exclude", path])
         command.append(str(context.workspace))
         return command

@@ -18,13 +18,14 @@ public static class WorkspaceArchive
         string outputPath,
         string? configPath,
         bool includeGit,
-        WorkspaceTransferLimits? limits = null)
+        WorkspaceTransferLimits? limits = null,
+        IReadOnlyCollection<string>? excludedFiles = null)
     {
         limits ??= WorkspaceTransferLimits.Default;
         var sourceRoot = Path.GetFullPath(workspace);
         var outputFullPath = Path.GetFullPath(outputPath);
         var configFullPath = configPath is null ? null : Path.GetFullPath(configPath);
-        var (files, directories) = Enumerate(sourceRoot, outputFullPath, configFullPath, includeGit, limits);
+        var (files, directories) = Enumerate(sourceRoot, outputFullPath, configFullPath, includeGit, limits, excludedFiles);
         var stats = new WorkspaceStats(files.Count, files.Sum(file => new FileInfo(file).Length));
         var archivePath = Path.Combine(Path.GetTempPath(), $"securityscan-{Guid.NewGuid():N}.tar");
 
@@ -77,10 +78,24 @@ public static class WorkspaceArchive
 
     public static string CreateSingleFile(string localFile, string archiveEntryName, WorkspaceTransferLimits? limits = null)
     {
+        return CreateInputArchive([(localFile, archiveEntryName)], limits);
+    }
+
+    public static string CreateInputArchive(
+        IReadOnlyCollection<(string SourcePath, string ArchivePath)> inputs,
+        WorkspaceTransferLimits? limits = null)
+    {
         limits ??= WorkspaceTransferLimits.Default;
-        if (new FileInfo(localFile).Length > limits.MaxFileBytes)
+        if (inputs.Count == 0)
         {
-            throw new InvalidDataException($"Configuration file exceeds the {limits.MaxFileBytes} byte per-file limit.");
+            throw new ArgumentException("At least one input file is required.", nameof(inputs));
+        }
+        foreach (var input in inputs)
+        {
+            if (new FileInfo(input.SourcePath).Length > limits.MaxFileBytes)
+            {
+                throw new InvalidDataException($"Input file exceeds the {limits.MaxFileBytes} byte per-file limit.");
+            }
         }
         var archivePath = Path.Combine(Path.GetTempPath(), $"securityscan-{Guid.NewGuid():N}.tar");
         try
@@ -88,24 +103,27 @@ public static class WorkspaceArchive
             using (var stream = CreatePrivateArchiveFile(archivePath))
             using (var writer = new TarWriter(stream, TarEntryFormat.Pax))
             {
-                var entry = new PaxTarEntry(TarEntryType.RegularFile, archiveEntryName)
+                foreach (var input in inputs.OrderBy(item => item.ArchivePath, StringComparer.Ordinal))
                 {
-                    Mode = (UnixFileMode)Convert.ToInt32("644", 8),
-                };
-                using var fileStream = File.OpenRead(localFile);
-                entry.DataStream = fileStream;
-                writer.WriteEntry(entry);
+                    var entry = new PaxTarEntry(TarEntryType.RegularFile, input.ArchivePath)
+                    {
+                        Mode = (UnixFileMode)Convert.ToInt32("644", 8),
+                    };
+                    using var fileStream = File.OpenRead(input.SourcePath);
+                    entry.DataStream = fileStream;
+                    writer.WriteEntry(entry);
+                }
             }
             if (new FileInfo(archivePath).Length > limits.MaxOutputArchiveBytes)
             {
-                throw new InvalidDataException("Configuration archive exceeds the derived archive metadata limit.");
+                throw new InvalidDataException("Input archive exceeds the derived archive metadata limit.");
             }
         }
         catch
         {
             if (!TryDelete(archivePath))
             {
-                Console.Error.WriteLine("[vesper] Temporary config archive cleanup failed; inspect the system temp directory.");
+                Console.Error.WriteLine("[vesper] Temporary input archive cleanup failed; inspect the system temp directory.");
             }
             throw;
         }
@@ -216,14 +234,16 @@ public static class WorkspaceArchive
         string outputPath,
         string? configPath,
         bool includeGit,
-        WorkspaceTransferLimits? limits = null)
+        WorkspaceTransferLimits? limits = null,
+        IReadOnlyCollection<string>? excludedFiles = null)
     {
         var (files, _) = Enumerate(
             Path.GetFullPath(workspace),
             Path.GetFullPath(outputPath),
             configPath is null ? null : Path.GetFullPath(configPath),
             includeGit,
-            limits ?? WorkspaceTransferLimits.Default);
+            limits ?? WorkspaceTransferLimits.Default,
+            excludedFiles);
         return new WorkspaceStats(files.Count, files.Sum(file => new FileInfo(file).Length));
     }
 
@@ -232,7 +252,8 @@ public static class WorkspaceArchive
         string outputPath,
         string? configPath,
         bool includeGit,
-        WorkspaceTransferLimits limits)
+        WorkspaceTransferLimits limits,
+        IReadOnlyCollection<string>? excludedFiles = null)
     {
         if (!Directory.Exists(sourceRoot))
         {
@@ -246,6 +267,12 @@ public static class WorkspaceArchive
         }
 
         var pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var excludedFilePaths = (excludedFiles ?? Array.Empty<string>())
+            .Select(Path.GetFullPath)
+            .Append(configPath)
+            .Where(path => path is not null)
+            .Cast<string>()
+            .ToHashSet(pathComparison == StringComparison.OrdinalIgnoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         var files = new List<string>();
         var directories = new List<string>();
         var entryCount = 0;
@@ -280,7 +307,7 @@ public static class WorkspaceArchive
                     pending.Push(entry);
                 }
                 else if (!IsSamePath(entry, outputPath, pathComparison)
-                         && (configPath is null || !IsSamePath(entry, configPath, pathComparison)))
+                         && !excludedFilePaths.Contains(Path.GetFullPath(entry)))
                 {
                     if (++entryCount > limits.MaxEntries)
                     {

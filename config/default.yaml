@@ -5,6 +5,11 @@ policy:
   failOnSecrets: true
   maxHigh: null
 
+baseline:
+  failOnNew:
+    - critical
+    - high
+
 timeouts:
   default: 300
   trivy: 600

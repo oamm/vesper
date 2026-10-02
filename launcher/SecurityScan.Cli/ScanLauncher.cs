@@ -9,8 +9,11 @@ public sealed record LaunchOptions(
     bool Verbose,
     string Image,
     string? ConfigPath,
+    string? BaselinePath,
     ScanResourceLimits ResourceLimits,
     WorkspaceTransferLimits TransferLimits);
+
+public sealed class BaselineInputException(string message) : Exception(message);
 
 public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClient = null)
 {
@@ -43,10 +46,36 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             }
         }
 
+        string? baselinePath = null;
+        if (options.BaselinePath is not null)
+        {
+            baselinePath = Path.GetFullPath(options.BaselinePath);
+            if (!File.Exists(baselinePath))
+            {
+                throw new BaselineInputException($"Baseline file was not found: {baselinePath}");
+            }
+            if ((File.GetAttributes(baselinePath) & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new BaselineInputException("Baseline file cannot be a symlink or reparse point.");
+            }
+        }
+        string? baselineExclusionPath = null;
+        if (baselinePath is not null)
+        {
+            var relativePath = Path.GetRelativePath(workspace, baselinePath);
+            var parentPrefix = $"..{Path.DirectorySeparatorChar}";
+            if (!Path.IsPathRooted(relativePath)
+                && relativePath != ".."
+                && !relativePath.StartsWith(parentPrefix, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            {
+                baselineExclusionPath = relativePath.Replace('\\', '/');
+            }
+        }
+
         var environment = await DockerEnvironmentDetector.DetectAsync(docker, cancellationToken);
         var mode = WorkspaceModeResolver.Resolve(options.WorkspaceMode, environment.IsRemote, environment.Endpoint, workspace);
         var execution = ScanExecutionContext.Create(
-            workspace, outputRoot, mode == WorkspaceMode.Volume, configPath is not null,
+            workspace, outputRoot, mode == WorkspaceMode.Volume, configPath is not null || baselinePath is not null,
             dockerContext: environment.Context);
         if (Directory.Exists(execution.OutputPath) || File.Exists(execution.OutputPath))
         {
@@ -60,7 +89,9 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         {
             Directory.CreateDirectory(execution.OutputPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
-        var stats = WorkspaceArchive.Measure(workspace, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits);
+        var excludedFiles = baselinePath is null ? null : new[] { baselinePath };
+        var stats = WorkspaceArchive.Measure(
+            workspace, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits, excludedFiles);
 
         Console.WriteLine("Vesper Security Scan");
         Console.WriteLine($"Started at (UTC): {execution.StartedAtText}");
@@ -90,15 +121,20 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
 
         if (mode == WorkspaceMode.Bind)
         {
-            return await RunWithBindMountsAsync(execution, configPath, cancellationToken);
+            return await RunWithBindMountsAsync(execution, configPath, baselinePath, baselineExclusionPath, cancellationToken);
         }
 
-        return await RunWithVolumesAsync(execution, configPath, cancellationToken);
+        return await RunWithVolumesAsync(execution, configPath, baselinePath, baselineExclusionPath, cancellationToken);
     }
 
-    private async Task<int> RunWithBindMountsAsync(ScanExecutionContext execution, string? configPath, CancellationToken cancellationToken)
+    private async Task<int> RunWithBindMountsAsync(
+        ScanExecutionContext execution,
+        string? configPath,
+        string? baselinePath,
+        string? baselineExclusionPath,
+        CancellationToken cancellationToken)
     {
-        var arguments = ScannerRunArguments(execution);
+        var arguments = ScannerRunArguments(execution, baselineExclusionPath);
         arguments.Add("--mount");
         arguments.Add(DockerMountArguments.Bind(execution.SourcePath, "/workspace", readOnly: true));
         arguments.Add("--mount");
@@ -108,8 +144,18 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             arguments.Add("--mount");
             arguments.Add(DockerMountArguments.Bind(configPath, "/config/security.yaml", readOnly: true));
         }
+        if (baselinePath is not null)
+        {
+            arguments.Add("--mount");
+            arguments.Add(DockerMountArguments.Bind(baselinePath, "/baseline.json", readOnly: true));
+        }
 
         arguments.Add(options.Image);
+        if (baselinePath is not null)
+        {
+            arguments.Add("--baseline");
+            arguments.Add("/baseline.json");
+        }
         Console.WriteLine("Running security scan...");
         try
         {
@@ -123,7 +169,12 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         }
     }
 
-    private async Task<int> RunWithVolumesAsync(ScanExecutionContext execution, string? configPath, CancellationToken cancellationToken)
+    private async Task<int> RunWithVolumesAsync(
+        ScanExecutionContext execution,
+        string? configPath,
+        string? baselinePath,
+        string? baselineExclusionPath,
+        CancellationToken cancellationToken)
     {
         var sourceVolume = execution.SourceVolumeName!;
         var outputVolume = execution.OutputVolumeName!;
@@ -135,8 +186,9 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
 
         try
         {
+            var excludedFiles = baselinePath is null ? null : new[] { baselinePath };
             var workspaceArchive = WorkspaceArchive.Create(
-                execution.SourcePath, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits);
+                execution.SourcePath, execution.OutputRootPath, configPath, options.IncludeGit, options.TransferLimits, excludedFiles);
             archivePaths.Add(workspaceArchive.ArchivePath);
             await CreateVolumeAsync(sourceVolume, execution, "source", cancellationToken);
             await CreateVolumeAsync(outputVolume, execution, "output", cancellationToken);
@@ -147,17 +199,26 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             await docker.UploadArchiveAsync(LauncherImages.ArchiveHelper, sourceVolume, "/workspace", workspaceArchive.ArchivePath, uploadName, execution, "upload", cancellationToken);
             Console.WriteLine("  completed");
 
-            if (configPath is not null && configVolume is not null)
+            if ((configPath is not null || baselinePath is not null) && configVolume is not null)
             {
                 await CreateVolumeAsync(configVolume, execution, "config", cancellationToken);
-                var configArchive = WorkspaceArchive.CreateSingleFile(configPath, "security.yaml", options.TransferLimits);
+                var inputs = new List<(string SourcePath, string ArchivePath)>();
+                if (configPath is not null)
+                {
+                    inputs.Add((configPath, "security.yaml"));
+                }
+                if (baselinePath is not null)
+                {
+                    inputs.Add((baselinePath, "baseline.json"));
+                }
+                var configArchive = WorkspaceArchive.CreateInputArchive(inputs, options.TransferLimits);
                 archivePaths.Add(configArchive);
                 var configUploadName = execution.HelperContainerName("config-upload");
                 helperContainers.Add(configUploadName);
                 await docker.UploadArchiveAsync(LauncherImages.ArchiveHelper, configVolume, "/security-config", configArchive, configUploadName, execution, "config-upload", cancellationToken);
             }
 
-            var scanArguments = ScannerRunArguments(execution);
+            var scanArguments = ScannerRunArguments(execution, baselineExclusionPath);
             scanArguments.Add("--mount");
             scanArguments.Add(DockerMountArguments.Volume(sourceVolume, "/workspace", readOnly: true));
             scanArguments.Add("--mount");
@@ -170,8 +231,16 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             scanArguments.Add(options.Image);
             if (configVolume is not null)
             {
-                scanArguments.Add("--config");
-                scanArguments.Add("/security-config/security.yaml");
+                if (configPath is not null)
+                {
+                    scanArguments.Add("--config");
+                    scanArguments.Add("/security-config/security.yaml");
+                }
+                if (baselinePath is not null)
+                {
+                    scanArguments.Add("--baseline");
+                    scanArguments.Add("/security-config/baseline.json");
+                }
             }
 
             Console.WriteLine("Running security scan...");
@@ -407,7 +476,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         }
     }
 
-    private List<string> ScannerRunArguments(ScanExecutionContext execution)
+    private List<string> ScannerRunArguments(ScanExecutionContext execution, string? baselineExclusionPath)
     {
         var arguments = new List<string>
         {
@@ -427,6 +496,11 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         {
             arguments.Add("--env");
             arguments.Add($"SECURITY_SCAN_OUTPUT_RELATIVE_PATH={execution.OutputExclusionPath}");
+        }
+        if (!string.IsNullOrWhiteSpace(baselineExclusionPath))
+        {
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_BASELINE_RELATIVE_PATH={baselineExclusionPath}");
         }
         return arguments;
     }

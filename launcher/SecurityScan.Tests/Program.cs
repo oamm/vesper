@@ -43,8 +43,10 @@ var tests = new (string Name, Action Run)[]
     ("Windows mount arguments", WindowsMountArguments),
     ("scanner exit preservation", ExitCodePreservation),
     ("saved gate exit semantics", SavedGateExitSemantics),
+    ("saved baseline comparison report and gate", SavedBaselineComparison),
     ("temporary volume cleanup", VolumeCleanup),
     ("workspace archive round trip", ArchiveRoundTrip),
+    ("runner input archive excludes source baseline", RunnerInputArchive),
     ("empty workspace archive is valid", EmptyWorkspaceArchive),
     ("private temporary archive permissions", PrivateArchivePermissions),
     ("reject archive traversal and absolute paths", RejectArchiveTraversal),
@@ -677,4 +679,151 @@ static void LegacyAndDateGroupedReportLookup()
     {
         Directory.Delete(root, recursive: true);
     }
+}
+
+static void RunnerInputArchive()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"securityscan-inputs-{Guid.NewGuid():N}");
+    var workspace = Path.Combine(root, "workspace");
+    var output = Path.Combine(root, "output");
+    var config = Path.Combine(root, "security.yaml");
+    var baseline = Path.Combine(workspace, "baseline.json");
+    Directory.CreateDirectory(workspace);
+    Directory.CreateDirectory(output);
+    File.WriteAllText(Path.Combine(workspace, "app.py"), "print('app')");
+    File.WriteAllText(baseline, "{\"schemaVersion\":1}");
+    File.WriteAllText(config, "policy: {}\n");
+
+    var sourceArchive = WorkspaceArchive.Create(
+        workspace, output, configPath: null, includeGit: false, excludedFiles: [baseline]);
+    var inputArchive = WorkspaceArchive.CreateInputArchive([
+        (config, "security.yaml"),
+        (baseline, "baseline.json"),
+    ]);
+    try
+    {
+        using (var stream = File.OpenRead(sourceArchive.ArchivePath))
+        using (var reader = new TarReader(stream))
+        {
+            var entries = new List<string>();
+            TarEntry? entry;
+            while ((entry = reader.GetNextEntry(copyData: false)) is not null)
+            {
+                entries.Add(entry.Name);
+            }
+            Check(entries.Any(name => name.EndsWith("app.py", StringComparison.Ordinal)), "workspace source should be archived");
+            Check(!entries.Any(name => name.EndsWith("baseline.json", StringComparison.Ordinal)), "baseline input must not be scanned as source");
+        }
+
+        using (var stream = File.OpenRead(inputArchive))
+        using (var reader = new TarReader(stream))
+        {
+            var entries = new List<string>();
+            TarEntry? entry;
+            while ((entry = reader.GetNextEntry(copyData: false)) is not null)
+            {
+                entries.Add(entry.Name);
+            }
+            Check(entries.SequenceEqual(["baseline.json", "security.yaml"]), "runner inputs should use deterministic reserved archive names");
+        }
+    }
+    finally
+    {
+        File.Delete(sourceArchive.ArchivePath);
+        File.Delete(inputArchive);
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void SavedBaselineComparison()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"vesper-baseline-report-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    var baselineId = $"baseline-{new string('a', 64)}";
+    var scanId = Guid.NewGuid().ToString("D");
+    const string startedAt = "2026-10-01T12:00:00+00:00";
+    var gateData = new
+    {
+        status = "failed",
+        reason = "New findings at configured severities: high",
+        blockingFindings = 1,
+        blockingRemediations = 0,
+        blockingFindingIds = new[] { "finding-1" },
+        baselineDelta = new { newFindings = 1, failOnNew = new[] { "high" }, blockingFindingIds = new[] { "finding-1" } },
+    };
+    File.WriteAllText(Path.Combine(root, "summary.json"), System.Text.Json.JsonSerializer.Serialize(new
+    {
+        status = "completed",
+        baselineComparison = new { baselineId, schemaVersion = 1 },
+        findings = new { total = 1 },
+        gate = gateData,
+        remediations = new { total = 0 },
+    }));
+    File.WriteAllText(Path.Combine(root, "scan.json"), System.Text.Json.JsonSerializer.Serialize(new
+    {
+        baselineId,
+        scanId,
+        startedAt,
+        executionStatus = "completed",
+        reportSchemas = new { comparison = 1 },
+        securityGate = gateData,
+    }));
+    File.WriteAllText(Path.Combine(root, "comparison.json"), System.Text.Json.JsonSerializer.Serialize(new
+    {
+        schemaVersion = 1,
+        baseline = new { baselineId, scanId = "baseline-scan", startedAt },
+        current = new { scanId, startedAt },
+        summary = new { @new = 1, existing = 0, changed = 0, resolved = 0, unverified = 0 },
+        findings = new
+        {
+            @new = new[] { new { state = "new", findingId = "finding-1" } },
+            existing = Array.Empty<object>(),
+            changed = Array.Empty<object>(),
+            resolved = Array.Empty<object>(),
+            unverified = Array.Empty<object>(),
+        },
+    }));
+
+    try
+    {
+        var report = RunCli("report", root);
+        Check(report.ExitCode == 0 && report.StandardOutput.Contains("NEW", StringComparison.Ordinal),
+            $"report should show compact baseline state counts (exit {report.ExitCode}; stdout: {report.StandardOutput}; stderr: {report.StandardError})");
+        var gate = RunCli("gate", root);
+        Check(gate.ExitCode == 1, "saved baseline-aware gate should preserve its original failed status");
+
+        File.Delete(Path.Combine(root, "comparison.json"));
+        var missingComparison = RunCli("gate", root);
+        Check(missingComparison.ExitCode == 2, "a missing comparison artifact must fail closed");
+        File.WriteAllText(Path.Combine(root, "comparison.json"), "{}");
+        var corruptComparison = RunCli("gate", root);
+        Check(corruptComparison.ExitCode == 2, "an unsupported comparison artifact must fail closed");
+        var missingBaseline = RunCli("scan", root, "--baseline", Path.Combine(root, "missing-baseline.json"));
+        Check(missingBaseline.ExitCode == 2, "a missing baseline input must use the indeterminate exit code");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static (int ExitCode, string StandardOutput, string StandardError) RunCli(params string[] arguments)
+{
+    var startInfo = new System.Diagnostics.ProcessStartInfo("dotnet")
+    {
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+    };
+    startInfo.ArgumentList.Add(typeof(ScanLauncher).Assembly.Location);
+    foreach (var argument in arguments)
+    {
+        startInfo.ArgumentList.Add(argument);
+    }
+    using var process = System.Diagnostics.Process.Start(startInfo)
+        ?? throw new InvalidOperationException("Unable to launch the CLI for the saved-report test.");
+    var standardOutput = process.StandardOutput.ReadToEnd();
+    var standardError = process.StandardError.ReadToEnd();
+    process.WaitForExit();
+    return (process.ExitCode, standardOutput, standardError);
 }

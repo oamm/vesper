@@ -98,6 +98,22 @@ class DetectionTests(unittest.TestCase):
             self.assertIn("custom-results", trivy_command[trivy_command.index("--skip-dirs") + 1])
             self.assertIn("custom-results", SastScanner().command(context))
 
+    def test_baseline_input_file_is_excluded_from_inventory_and_scanners(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.py").write_text("print('app')", encoding="utf-8")
+            (root / "baseline.json").write_text("{}", encoding="utf-8")
+            project = detect_project(root, exclude_files={"baseline.json"})
+            self.assertEqual(project.file_count, 1)
+            self.assertNotIn("baseline.json", project.artifacts)
+            self.assertIn({"path": "baseline.json", "reason": "baseline_input"}, project.exclusions)
+
+            context = ScannerContext(root, root / "out", root / "out" / "raw", project, 5, exclude_files=["baseline.json"])
+            trivy_command = TrivyScanner().command(context)
+            self.assertEqual(trivy_command[trivy_command.index("--skip-files") + 1], "baseline.json")
+            semgrep_command = SastScanner().command(context)
+            self.assertTrue(any(semgrep_command[index:index + 2] == ["--exclude", "baseline.json"] for index in range(len(semgrep_command) - 1)))
+
 
 class NormalizationTests(unittest.TestCase):
     def test_dependency_title_uses_detected_package_and_keeps_native_advisory(self):
@@ -691,6 +707,7 @@ class ScannerContinuationTests(unittest.TestCase):
             self.assertEqual(coverage["filesDiscovered"], 2)
             self.assertEqual(coverage["attemptedFiles"], 1)
             self.assertEqual(coverage["filesAnalyzed"], 0)
+            self.assertEqual(coverage["analyzedFiles"], [])
             self.assertNotIn("filesSkipped", coverage)
             self.assertEqual(coverage["pathsReportedScanned"], 1)
             self.assertEqual(coverage["csharpFilesAnalyzed"], 0)

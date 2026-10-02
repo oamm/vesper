@@ -3,6 +3,7 @@ import os
 import sys
 from pathlib import Path
 
+from security_runner.baseline import BaselineError, load_baseline
 from security_runner.runner import (
     EXIT_CONFIG_ERROR,
     EXIT_INTERNAL_ERROR,
@@ -21,6 +22,7 @@ def main() -> int:
     parser.add_argument("--workspace", default="/workspace", type=Path)
     parser.add_argument("--output", default="/output", type=Path)
     parser.add_argument("--config", default=None, type=Path)
+    parser.add_argument("--baseline", default=None, type=Path)
     args = parser.parse_args()
     config_path = args.config or (Path("/config/security.yaml") if Path("/config/security.yaml").exists() else None)
     try:
@@ -29,8 +31,12 @@ def main() -> int:
         print(f"[config] {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
     try:
-        exit_code, _ = run_scan(args.workspace, args.output, config)
+        baseline = load_baseline(args.baseline) if args.baseline else None
+        exit_code, _ = run_scan(args.workspace, args.output, config, baseline=baseline)
         return exit_code
+    except BaselineError as exc:
+        print(f"[baseline] {exc}", file=sys.stderr)
+        return EXIT_RUNNER_FAILED
     except ReportConsistencyError as exc:
         print(f"[report] {exc}", file=sys.stderr)
         return EXIT_RUNNER_FAILED

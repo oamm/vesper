@@ -7,6 +7,12 @@ from typing import Any
 
 import yaml
 
+from security_runner.baseline import (
+    BaselineError,
+    compare_findings,
+    validate_baseline,
+    validate_comparison,
+)
 from security_runner.detection import detect_project
 from security_runner.models import ScannerContext
 from security_runner.normalization import SEVERITY_WEIGHT, deduplicate
@@ -51,7 +57,15 @@ def load_config(config_path: Path | None) -> dict[str, Any]:
         raise ConfigurationError(f"Unable to load configuration: {exc}") from exc
 
 
-def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_instances: list[Any] | None = None) -> tuple[int, dict[str, Any]]:
+def run_scan(
+    workspace: Path,
+    output: Path,
+    config: dict[str, Any],
+    scanner_instances: list[Any] | None = None,
+    baseline: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    if baseline is not None:
+        validate_baseline(baseline)
     workspace = workspace.resolve()
     output = output.resolve()
     if not workspace.is_dir():
@@ -71,10 +85,12 @@ def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_inst
     scan_id = os.environ.get("SECURITY_SCAN_ID") or str(uuid.uuid4())
     output_exclusion = os.environ.get("SECURITY_SCAN_OUTPUT_RELATIVE_PATH")
     exclude_paths = [output_exclusion] if output_exclusion else []
+    baseline_exclusion = os.environ.get("SECURITY_SCAN_BASELINE_RELATIVE_PATH")
+    exclude_files = [baseline_exclusion.replace("\\", "/")] if baseline_exclusion else []
 
     print(f"[runner] Scan {scan_id} started at {started_at_text}", flush=True)
     print("[runner] Detecting project...", flush=True)
-    project = detect_project(workspace, set(exclude_paths))
+    project = detect_project(workspace, set(exclude_paths), set(exclude_files))
     print(f"[runner] Detected {', '.join(project.technologies) if project.technologies else 'no known technologies'}", flush=True)
 
     scanner_config = config.get("scanner", {})
@@ -88,7 +104,7 @@ def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_inst
     scanner_results = []
     for scanner in scanners:
         timeout = int(timeout_config.get(scanner.name, timeout_config.get("default", 300)))
-        context = ScannerContext(workspace, output, raw_dir, project, timeout, exclude_paths)
+        context = ScannerContext(workspace, output, raw_dir, project, timeout, exclude_paths, exclude_files)
         result, findings = scanner.execute(context)
         scanner_results.append(result.report())
         all_findings.extend(findings)
@@ -116,13 +132,33 @@ def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_inst
             "status": "indeterminate",
             "reason": incomplete_reason,
         }
-    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project)
-
     finished = datetime.now(timezone.utc)
     duration_ms = max(0, int((finished - started_at).total_seconds() * 1000))
+    comparison = None
+    if baseline is not None:
+        comparison_scan = {
+            "executionStatus": execution_status,
+            "scanId": scan_id,
+            "startedAt": started_at_text,
+            "scanners": scanner_results,
+        }
+        comparison = compare_findings(baseline, findings, remediations, comparison_scan, project.report())
+        if execution_status == "completed":
+            gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
+        else:
+            gate = {**gate, "baselineDelta": _baseline_delta(comparison, remediations, config)}
+    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project)
+    if comparison is not None:
+        summary["baselineComparison"] = {
+            "baselineId": comparison["baseline"]["baselineId"],
+            "schemaVersion": comparison["schemaVersion"],
+        }
+    report_schemas = {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2}
+    if comparison is not None:
+        report_schemas["comparison"] = comparison["schemaVersion"]
     scan_report = {
         "schemaVersion": 2,
-        "reportSchemas": {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2},
+        "reportSchemas": report_schemas,
         "scanId": scan_id,
         "startedAt": started_at_text,
         "finishedAt": finished.isoformat(),
@@ -133,13 +169,19 @@ def run_scan(workspace: Path, output: Path, config: dict[str, Any], scanner_inst
         "generator": {"name": "Vesper", "version": __version__},
         "scanners": scanner_results,
     }
+    if comparison is not None:
+        scan_report["baselineId"] = comparison["baseline"]["baselineId"]
     project_report = project.report()
-    _validate_report_consistency(project_report, findings, remediations, summary, scan_report)
+    if comparison is not None:
+        validate_comparison(comparison, baseline, findings, scan_report)
+    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison)
     (output / "project.json").write_text(json.dumps(project_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "remediations.json").write_text(json.dumps(remediations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "scan.json").write_text(json.dumps(scan_report, indent=2) + "\n", encoding="utf-8")
+    if comparison is not None:
+        (output / "comparison.json").write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_summary(project.technologies, summary, remediations, scanner_results)
     if execution_status != "completed":
         return EXIT_RUNNER_FAILED, scan_report
@@ -184,6 +226,58 @@ def _summary(
         "remediations": {"total": len(remediations), "priority": priorities},
         "coverage": {"scanners": coverage_by_scanner, "capabilities": coverage_by_capability, "warnings": coverage_warnings},
         "gate": gate,
+    }
+
+
+def _apply_baseline_gate(
+    absolute_gate: dict[str, Any],
+    findings: list[dict[str, Any]],
+    remediations: list[dict[str, Any]],
+    comparison: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    delta = _baseline_delta(comparison, remediations, config)
+    baseline_policy = config.get("baseline", {})
+    new_finding_ids = set(delta["blockingFindingIds"])
+    blocking_ids = set(absolute_gate.get("blockingFindingIds", [])) | new_finding_ids
+    reasons = []
+    if absolute_gate.get("status") == "failed":
+        reasons.append(absolute_gate.get("reason", "Absolute security policy failed"))
+    if new_finding_ids:
+        severities = sorted({
+            record["severity"] for record in comparison["findings"]["new"]
+            if record.get("findingId") in new_finding_ids
+        })
+        reasons.append(f"New findings at configured severities: {', '.join(severities)}")
+    blocking_remediations = sum(
+        1 for remediation in remediations
+        if blocking_ids.intersection(remediation.get("affectedFindings", []))
+    )
+    return {
+        **absolute_gate,
+        "status": "failed" if reasons else "passed",
+        "reason": "; ".join(reasons) or "Policy passed",
+        "blockingFindings": len(blocking_ids),
+        "blockingRemediations": blocking_remediations,
+        "blockingFindingIds": sorted(blocking_ids),
+        "baselineDelta": delta,
+    }
+
+
+def _baseline_delta(
+    comparison: dict[str, Any],
+    remediations: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    fail_on_new = set(config.get("baseline", {}).get("failOnNew", ["critical", "high"]))
+    blockers = {
+        record["findingId"] for record in comparison["findings"]["new"]
+        if record.get("severity") in fail_on_new
+    }
+    return {
+        "newFindings": len(comparison["findings"]["new"]),
+        "failOnNew": sorted(fail_on_new),
+        "blockingFindingIds": sorted(blockers),
     }
 
 
@@ -314,6 +408,7 @@ def _validate_report_consistency(
     remediations: list[dict[str, Any]],
     summary: dict[str, Any],
     scan: dict[str, Any],
+    comparison: dict[str, Any] | None = None,
 ) -> None:
     def require(condition: bool, message: str) -> None:
         if not condition:
@@ -327,7 +422,21 @@ def _validate_report_consistency(
     require(sum(project.get("artifactSummary", {}).values()) == project.get("artifactCount"), "Project artifact summary does not match artifact inventory.")
     require(project.get("sourceFileCount", 0) <= project.get("fileCount", 0), "Project source count exceeds its file count.")
     require(summary.get("schemaVersion") == 2 and scan.get("schemaVersion") == 2, "Unsupported summary or scan report schema version.")
-    require(scan.get("reportSchemas") == {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2}, "Scan report schema manifest is inconsistent.")
+    expected_schemas = {"project": 2, "scan": 2, "findings": 2, "remediations": 2, "summary": 2}
+    if comparison is not None:
+        expected_schemas["comparison"] = 1
+    require(scan.get("reportSchemas") == expected_schemas, "Scan report schema manifest is inconsistent.")
+    if comparison is None:
+        require("baselineComparison" not in summary and "baselineId" not in scan, "Baseline metadata exists without a comparison report.")
+    else:
+        require(
+            summary.get("baselineComparison") == {
+                "baselineId": comparison.get("baseline", {}).get("baselineId"),
+                "schemaVersion": comparison.get("schemaVersion"),
+            },
+            "Summary baseline metadata is inconsistent.",
+        )
+        require(scan.get("baselineId") == comparison.get("baseline", {}).get("baselineId"), "Scan baseline ID is inconsistent.")
     require(summary.get("status") == scan.get("executionStatus"), "Scan and summary execution statuses disagree.")
     require(summary.get("gate") == scan.get("securityGate"), "Scan and summary gate reports disagree.")
     require(scan.get("executionStatus") in {"completed", "incomplete"}, "Scan has an unsupported execution status.")
@@ -384,6 +493,26 @@ def _validate_report_consistency(
         1 for remediation in remediations if set(remediation.get("affectedFindings", [])) & set(blocking_ids)
     )
     require(gate.get("blockingRemediations") == expected_blocking_remediations, "Gate blocking remediation count is inconsistent.")
+    if comparison is not None:
+        delta = gate.get("baselineDelta")
+        new_records = comparison.get("findings", {}).get("new", [])
+        new_ids = {record.get("findingId") for record in new_records}
+        require(isinstance(delta, dict), "Baseline-aware gate metadata is missing.")
+        require(delta.get("newFindings") == len(new_records), "Baseline gate new-finding count is inconsistent.")
+        fail_on_new = delta.get("failOnNew")
+        require(
+            isinstance(fail_on_new, list)
+            and all(severity in severity_counts for severity in fail_on_new),
+            "Baseline gate severity policy is malformed.",
+        )
+        expected_delta_blockers = {
+            record["findingId"] for record in new_records if record.get("severity") in fail_on_new
+        }
+        require(
+            set(delta.get("blockingFindingIds", [])) == expected_delta_blockers
+            and set(delta.get("blockingFindingIds", [])) <= new_ids,
+            "Baseline gate blockers do not match configured new-finding severities.",
+        )
 
     scanner_results = {result["name"]: result for result in scan.get("scanners", [])}
     coverage_scanners = summary.get("coverage", {}).get("scanners", {})
@@ -472,6 +601,12 @@ def _validate_config(config: dict[str, Any]) -> None:
     max_high = policy.get("maxHigh")
     if max_high is not None and (not isinstance(max_high, int) or max_high < 0):
         raise ConfigurationError("policy.maxHigh must be a non-negative integer or null")
+    baseline = config.get("baseline", {})
+    if not isinstance(baseline, dict):
+        raise ConfigurationError("baseline must be a mapping")
+    fail_on_new = baseline.get("failOnNew", ["critical", "high"])
+    if not isinstance(fail_on_new, list) or any(value not in {"critical", "high", "medium", "low", "info", "unknown"} for value in fail_on_new):
+        raise ConfigurationError("baseline.failOnNew must be a list of normalized severities")
     timeouts = config.get("timeouts", {})
     for name, value in timeouts.items():
         if not isinstance(value, int) or value < 1 or value > 3600:

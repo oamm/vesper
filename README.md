@@ -74,6 +74,30 @@ sh ./vesper.sh scan . --workspace-mode volume --keep-volumes
 
 The CLI also provides `vesper inspect`, `vesper report [output-directory]`, `vesper gate [output-directory]`, and `vesper version`.
 
+## Baselines
+
+The Python report engine creates baselines from completed schema-v2 scan directories. With Python 3.11 and the repository dependencies available:
+
+```powershell
+$env:PYTHONPATH = ".\src"
+python -m security_runner.baseline_cli create .\security-results\<scan-directory> --output .\baseline.json
+.\vesper.ps1 scan . --baseline .\baseline.json
+```
+
+`baseline.json` contains versioned semantic identities and minimal coverage evidence, not raw scanner output. A scan with `--baseline` writes `comparison.json`; `findings.json` remains the current scan evidence. `vesper report` prints state counts and `vesper gate` reproduces the saved gate after validating the comparison artifact.
+
+Baseline delta policy defaults to failing new critical/high findings. Existing absolute policy remains active. For incremental adoption where existing high findings should not block, use a config override such as:
+
+```yaml
+policy:
+  failOn: []
+  failOnSecrets: false
+baseline:
+  failOnNew:
+    - critical
+    - high
+```
+
 The launcher inspects the active Docker endpoint, not its context name. `npipe://`, `unix://`, and loopback TCP endpoints use local bind mounts in `auto` mode. SSH and non-loopback TCP/HTTP(S) endpoints use temporary named volumes. Explicit `--workspace-mode bind` against a remote endpoint fails early with the workspace and endpoint in the error; `volume` can also be forced for local daemons.
 
 Remote mode builds a local PAX tar archive and streams its bytes through Docker stdin into a uniquely named volume. The pinned `alpine:3.21.3` helper supplies BusyBox tar on the daemon host for import/export; it stays separate from the Python scanner image and is centrally versioned in the launcher. It excludes generated directories by default (`.git`, `node_modules`, `bin`, `obj`, `dist`, `build`, `coverage`, `security-results`, virtual environments, and Terraform cache); use `--include-git` only when rules need repository history. The source volume is mounted read-only at `/workspace`, and a separate output volume is streamed back through Docker stdout. Reports are validated and extracted to a private scan-specific staging directory; only after the complete archive validates is that directory published at the final path. Output symlink/hardlink and special entries are ignored, never created. Symlinks and reparse points in source workspaces are skipped instead of followed. On Unix, literal backslash filenames remain distinct from slash-separated paths.

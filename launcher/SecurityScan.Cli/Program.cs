@@ -71,6 +71,11 @@ internal static class Program
         {
             return await new ScanLauncher(options).RunAsync(cancellation.Token);
         }
+        catch (BaselineInputException exception)
+        {
+            Console.Error.WriteLine($"[baseline] {exception.Message}");
+            return 2;
+        }
         catch (OperationCanceledException)
         {
             Console.Error.WriteLine("[launcher] Interrupted.");
@@ -123,6 +128,7 @@ internal static class Program
         var verbose = false;
         var image = LauncherImages.DefaultRunner;
         string? config = null;
+        string? baseline = null;
         var cpus = ScanResourceLimits.Default.Cpus;
         var memory = ScanResourceLimits.Default.Memory;
         var pidsLimit = ScanResourceLimits.Default.PidsLimit.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -158,6 +164,7 @@ internal static class Program
                     };
                     break;
                 case "--config": config = Value(); break;
+                case "--baseline": baseline = Value(); break;
                 case "--image": image = Value(); break;
                 case "--cpus": cpus = Value(); break;
                 case "--memory": memory = Value(); break;
@@ -194,6 +201,7 @@ internal static class Program
             verbose,
             image,
             config,
+            baseline,
             ScanResourceLimits.Parse(cpus, memory, pidsLimit),
             WorkspaceTransferLimits.Parse(maxWorkspaceBytes, maxFiles, maxFileBytes, maxOutputBytes, maxOutputFiles, maxEntries));
     }
@@ -211,6 +219,7 @@ internal static class Program
         Console.WriteLine("  --output PATH             Output base; each scan writes to a unique child directory");
         Console.WriteLine("  --workspace-mode MODE     auto, bind, or volume (default: auto)");
         Console.WriteLine("  --config PATH             Optional local scanner YAML configuration");
+        Console.WriteLine("  --baseline PATH           Compare against a versioned baseline artifact");
         Console.WriteLine("  --include-git             Include .git history in volume staging");
         Console.WriteLine("  --keep-volumes            Keep temporary Docker volumes and print their names");
         Console.WriteLine($"  --image IMAGE             Scanner image (default: {LauncherImages.DefaultRunner})");
@@ -265,6 +274,15 @@ internal static class Program
         var root = document.RootElement;
         var gate = root.GetProperty("gate");
         var gateStatus = gate.GetProperty("status").GetString() ?? "unknown";
+        var hasBaselineDelta = gate.TryGetProperty("baselineDelta", out _);
+        var hasBaselineMetadata = root.TryGetProperty("baselineComparison", out _);
+        Dictionary<string, int>? comparisonCounts = null;
+        if (hasBaselineDelta != hasBaselineMetadata
+            || (hasBaselineMetadata && !TryReadComparisonSummary(reportDirectory, root, out comparisonCounts)))
+        {
+            Console.Error.WriteLine("[report] Baseline comparison artifacts are missing or inconsistent.");
+            return 2;
+        }
         if (command == "gate")
         {
             Console.WriteLine("Vesper Security Gate");
@@ -285,6 +303,14 @@ internal static class Program
         Console.WriteLine($"Findings: {findingsTotal}");
         Console.WriteLine($"Remediations: {root.GetProperty("remediations").GetProperty("total").GetInt32()}");
         Console.WriteLine($"Security Gate: {gateStatus.ToUpperInvariant()}");
+        if (comparisonCounts is not null)
+        {
+            Console.WriteLine("Baseline comparison");
+            foreach (var state in new[] { "new", "existing", "changed", "resolved", "unverified" })
+            {
+                Console.WriteLine($"  {state.ToUpperInvariant(),-12}{comparisonCounts[state]}");
+            }
+        }
         var remediationPath = Path.Combine(reportDirectory, "remediations.json");
         if (File.Exists(remediationPath))
         {
@@ -297,6 +323,94 @@ internal static class Program
             }
         }
         return 0;
+    }
+
+    private static bool TryReadComparisonSummary(
+        string reportDirectory,
+        JsonElement summary,
+        out Dictionary<string, int>? counts)
+    {
+        counts = null;
+        try
+        {
+            using var comparisonDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(reportDirectory, "comparison.json")));
+            using var scanDocument = JsonDocument.Parse(File.ReadAllText(Path.Combine(reportDirectory, "scan.json")));
+            var comparison = comparisonDocument.RootElement;
+            var scan = scanDocument.RootElement;
+            var baselineMetadata = summary.GetProperty("baselineComparison");
+            var baseline = comparison.GetProperty("baseline");
+            var current = comparison.GetProperty("current");
+            var reportSchemas = scan.GetProperty("reportSchemas");
+            if (comparison.GetProperty("schemaVersion").GetInt32() != 1
+                || reportSchemas.GetProperty("comparison").GetInt32() != 1
+                || baseline.GetProperty("baselineId").GetString() != baselineMetadata.GetProperty("baselineId").GetString()
+                || scan.GetProperty("baselineId").GetString() != baseline.GetProperty("baselineId").GetString()
+                || current.GetProperty("scanId").GetString() != scan.GetProperty("scanId").GetString()
+                || current.GetProperty("startedAt").GetString() != scan.GetProperty("startedAt").GetString()
+                || summary.GetProperty("status").GetString() != scan.GetProperty("executionStatus").GetString()
+                || !GateArtifactsMatch(summary.GetProperty("gate"), scan.GetProperty("securityGate")))
+            {
+                return false;
+            }
+
+            var summaryCounts = comparison.GetProperty("summary");
+            var groups = comparison.GetProperty("findings");
+            var parsedCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var state in new[] { "new", "existing", "changed", "resolved", "unverified" })
+            {
+                var records = groups.GetProperty(state);
+                var count = summaryCounts.GetProperty(state).GetInt32();
+                if (records.ValueKind != JsonValueKind.Array || records.GetArrayLength() != count)
+                {
+                    return false;
+                }
+                parsedCounts.Add(state, count);
+            }
+            counts = parsedCounts;
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static bool GateArtifactsMatch(JsonElement summaryGate, JsonElement scanGate)
+    {
+        foreach (var property in new[] { "status", "reason", "blockingFindings", "blockingRemediations", "policyStatus" })
+        {
+            var hasSummaryValue = summaryGate.TryGetProperty(property, out var summaryValue);
+            var hasScanValue = scanGate.TryGetProperty(property, out var scanValue);
+            if (hasSummaryValue != hasScanValue
+                || (hasSummaryValue && summaryValue.GetRawText() != scanValue.GetRawText()))
+            {
+                return false;
+            }
+        }
+
+        if (!summaryGate.TryGetProperty("blockingFindingIds", out var summaryIds)
+            || !scanGate.TryGetProperty("blockingFindingIds", out var scanIds)
+            || !summaryIds.EnumerateArray().Select(item => item.GetString()).SequenceEqual(scanIds.EnumerateArray().Select(item => item.GetString())))
+        {
+            return false;
+        }
+
+        var hasSummaryDelta = summaryGate.TryGetProperty("baselineDelta", out var summaryDelta);
+        var hasScanDelta = scanGate.TryGetProperty("baselineDelta", out var scanDelta);
+        if (hasSummaryDelta != hasScanDelta)
+        {
+            return false;
+        }
+        if (!hasSummaryDelta)
+        {
+            return true;
+        }
+
+        return summaryDelta.GetProperty("newFindings").GetInt32() == scanDelta.GetProperty("newFindings").GetInt32()
+            && summaryDelta.GetProperty("failOnNew").EnumerateArray().Select(item => item.GetString())
+                .SequenceEqual(scanDelta.GetProperty("failOnNew").EnumerateArray().Select(item => item.GetString()))
+            && summaryDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString())
+                .SequenceEqual(scanDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString()));
     }
 
 }
