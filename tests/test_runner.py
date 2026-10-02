@@ -1094,6 +1094,34 @@ class ScannerContinuationTests(unittest.TestCase):
             self.assertEqual(report["executionStatus"], "incomplete")
             self.assertEqual(report["securityGate"]["status"], "indeterminate")
 
+    def test_known_policy_blockers_remain_failed_when_execution_is_incomplete(self):
+        class PartiallyFailedScanner:
+            name = "trivy"
+
+            def execute(self, context):
+                findings = normalize("trivy", {"Results": [{"Target": "package-lock.json", "Vulnerabilities": [{
+                    "VulnerabilityID": "CVE-2024-12345", "PkgName": "example", "InstalledVersion": "1.0.0",
+                    "FixedVersion": "1.0.1", "Severity": "HIGH",
+                }]}]})
+                result = ScannerResult(
+                    self.name, "test", "failed", datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(), 1, "raw/trivy.json", "scanner failed",
+                    finding_count=len(findings), coverage={"assessment": "unknown"},
+                )
+                return result, findings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            (root / "package-lock.json").write_text("{}", encoding="utf-8")
+            config = {"policy": {"failOn": ["high"], "failOnSecrets": False, "maxHigh": None}, "timeouts": {}}
+            code, report = run_scan(root, Path(temporary) / "out", config, [PartiallyFailedScanner()])
+            self.assertEqual(code, 2)
+            self.assertEqual(report["executionStatus"], "incomplete")
+            self.assertEqual(report["securityGate"]["status"], "failed")
+            self.assertEqual(report["securityGate"]["blockingFindings"], 1)
+            self.assertIn("executionLimitation", report["securityGate"])
+
     def test_disabled_scanner_is_skipped_not_clean(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from security_runner.baseline import BaselineError, create_baseline, load_baseline, normalize_target
 from security_runner.baseline_cli import main as baseline_cli_main
 from security_runner.models import ScannerResult
-from security_runner.normalization import normalize
+from security_runner.normalization import normalize, normalize_grype
 from security_runner.runner import run_scan
 from security_runner.scanners import OsvScanner, SastScanner
 
@@ -396,6 +396,68 @@ class BaselineTests(unittest.TestCase):
             comparison = json.loads((output / "comparison.json").read_text(encoding="utf-8"))
             self.assertEqual(code, 2)
             self.assertEqual(comparison["findings"]["unverified"][0]["reasonCode"], "capability_not_executed")
+
+    def test_grype_coverage_loss_is_unverified_not_resolved(self):
+        class GrypeFixtureScanner:
+            name = "grype"
+
+            def __init__(self, raw, inventory):
+                self.raw = raw
+                self.extra_artifacts = {"components": inventory}
+
+            def execute(self, context):
+                findings = normalize_grype(self.raw, self.extra_artifacts["components"])
+                status = "completed_with_findings" if findings else "clean"
+                now = datetime.now(timezone.utc).isoformat()
+                result = ScannerResult(
+                    self.name, "0.119.0", status, now, now, 1, "raw/grype.json",
+                    finding_count=len(findings),
+                    coverage={
+                        "assessment": "unknown",
+                        "input": "raw/syft.cdx.json",
+                        "inputAssessment": "unknown",
+                        "analysisStatus": "completed",
+                    },
+                )
+                return result, findings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "packages.lock.json").write_text("{}", encoding="utf-8")
+            raw = {
+                "descriptor": {"name": "grype", "version": "0.119.0"},
+                "matches": [{
+                    "vulnerability": {"id": "GHSA-test-1234-5678", "severity": "HIGH", "fix": {"versions": ["1.0.1"]}},
+                    "artifact": {"name": "Example.Package", "version": "1.0.0", "purl": "pkg:nuget/Example.Package@1.0.0"},
+                }],
+            }
+            inventory = {
+                "schemaVersion": 1,
+                "format": "CycloneDX",
+                "specVersion": "1.7",
+                "rawOutput": "raw/syft.cdx.json",
+                "components": [{
+                    "id": "component-example",
+                    "type": "library",
+                    "ecosystem": "nuget",
+                    "name": "Example.Package",
+                    "version": "1.0.0",
+                    "purl": "pkg:nuget/Example.Package@1.0.0",
+                    "occurrences": [{"path": "packages.lock.json"}],
+                    "evidence": [],
+                }],
+            }
+            initial = root / "initial"
+            self._run_fixture(workspace, initial, GrypeFixtureScanner(raw, inventory))
+            baseline = create_baseline(initial, root / "grype-baseline.json")
+            current = root / "current"
+            code, _ = self._run_fixture(workspace, current, GrypeFixtureScanner({"descriptor": raw["descriptor"], "matches": []}, inventory), baseline)
+            comparison = json.loads((current / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(comparison["summary"], {"new": 0, "existing": 0, "changed": 0, "resolved": 0, "unverified": 1})
+            self.assertIn(comparison["findings"]["unverified"][0]["reasonCode"], {"coverage_unknown", "target_not_covered"})
 
     def test_completed_scan_comparison_is_deterministic_and_saved_gate_metadata_matches(self):
         with tempfile.TemporaryDirectory() as temporary:

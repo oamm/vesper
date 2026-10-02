@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -143,12 +144,20 @@ def run_scan(
         else:
             failed_names = ", ".join(result["name"] for result in failed_scanners)
             incomplete_reason = f"Scanner execution incomplete ({failed_names}); security assessment is indeterminate."
-        gate = {
-            **gate,
-            "policyStatus": gate["status"],
-            "status": "indeterminate",
-            "reason": incomplete_reason,
-        }
+        if gate["status"] == "failed":
+            gate = {
+                **gate,
+                "policyStatus": "failed",
+                "executionLimitation": incomplete_reason,
+                "reason": f"{gate['reason']}; {incomplete_reason}",
+            }
+        else:
+            gate = {
+                **gate,
+                "policyStatus": "passed",
+                "status": "indeterminate",
+                "reason": incomplete_reason,
+            }
     finished = datetime.now(timezone.utc)
     duration_ms = max(0, int((finished - started_at).total_seconds() * 1000))
     comparison = None
@@ -164,7 +173,7 @@ def run_scan(
             gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
         else:
             gate = {**gate, "baselineDelta": _baseline_delta(comparison, remediations, config)}
-    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory)
+    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config)
     if comparison is not None:
         summary["baselineComparison"] = {
             "baselineId": comparison["baseline"]["baselineId"],
@@ -188,9 +197,14 @@ def run_scan(
         "generator": {"name": "Vesper", "version": __version__},
         "scanners": scanner_results,
     }
+    repository_metadata = _repository_metadata()
+    if repository_metadata:
+        scan_report["repository"] = repository_metadata
     if comparison is not None:
         scan_report["baselineId"] = comparison["baseline"]["baselineId"]
     project_report = project.report()
+    project_report["projectName"] = os.environ.get("SECURITY_SCAN_PROJECT_NAME") or workspace.name or ""
+    project_report["projectNameSource"] = "launcher-workspace-directory" if os.environ.get("SECURITY_SCAN_PROJECT_NAME") else "workspace-directory"
     if comparison is not None:
         validate_comparison(comparison, baseline, findings, scan_report)
     _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory)
@@ -217,6 +231,7 @@ def _summary(
     scanner_results: list[dict[str, Any]],
     project: Any,
     component_inventory: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
@@ -240,13 +255,15 @@ def _summary(
     }
     coverage_by_capability = _capability_coverage(scanner_results)
     coverage_warnings = _coverage_warnings(scanner_results, project)
+    coverage_assessment = _overall_coverage(coverage_by_capability)
     summary = {
         "schemaVersion": 2,
         "generator": {"name": "Vesper", "version": __version__},
         "status": execution_status,
         "findings": {"total": len(findings), "severity": severities, "categories": categories},
         "remediations": {"total": len(remediations), "priority": priorities},
-        "coverage": {"scanners": coverage_by_scanner, "capabilities": coverage_by_capability, "warnings": coverage_warnings},
+        "coverage": {"assessment": coverage_assessment, "scanners": coverage_by_scanner, "capabilities": coverage_by_capability, "warnings": coverage_warnings},
+        "effectivePolicy": _effective_policy(config or {}),
         "gate": gate,
     }
     if component_inventory is not None:
@@ -265,6 +282,42 @@ def _summary(
             }),
         }
     return summary
+
+
+def _overall_coverage(capabilities: dict[str, Any]) -> str:
+    assessments = [item.get("assessment", "unknown") for item in capabilities.values() if item.get("assessment") != "not_applicable"]
+    if not assessments:
+        return "unknown"
+    if "unknown" in assessments:
+        return "unknown"
+    if any(value in {"partial", "limited"} for value in assessments):
+        return "partial"
+    return "complete" if all(value == "complete" for value in assessments) else "unknown"
+
+
+def _effective_policy(config: dict[str, Any]) -> dict[str, Any]:
+    policy = config.get("policy", {})
+    return {
+        "blockingSeverities": sorted(str(value).lower() for value in policy.get("failOn", [])),
+        "failOnSecrets": bool(policy.get("failOnSecrets", False)),
+        "maxHigh": policy.get("maxHigh"),
+        "requiredScanners": "Not recorded",
+        "requiredCategories": "Not recorded",
+        "coverageRequirements": "Not recorded",
+        "exceptions": "Not recorded",
+        "configurationHash": hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+        "configurationSource": os.environ.get("SECURITY_SCAN_CONFIG_SOURCE") or "Not recorded",
+    }
+
+
+def _repository_metadata() -> dict[str, Any]:
+    values = {
+        "commit": os.environ.get("SECURITY_SCAN_REPOSITORY_COMMIT"),
+        "branch": os.environ.get("SECURITY_SCAN_REPOSITORY_BRANCH"),
+        "dirty": os.environ.get("SECURITY_SCAN_REPOSITORY_DIRTY"),
+        "remote": os.environ.get("SECURITY_SCAN_REPOSITORY_REMOTE"),
+    }
+    return {key: value for key, value in values.items() if value not in (None, "")}
 
 
 def _apply_baseline_gate(
@@ -481,7 +534,8 @@ def _validate_report_consistency(
     require(summary.get("status") == scan.get("executionStatus"), "Scan and summary execution statuses disagree.")
     require(summary.get("gate") == scan.get("securityGate"), "Scan and summary gate reports disagree.")
     require(scan.get("executionStatus") in {"completed", "incomplete"}, "Scan has an unsupported execution status.")
-    require((scan.get("executionStatus") == "incomplete") == (summary.get("gate", {}).get("status") == "indeterminate"), "Incomplete scans must have an indeterminate gate.")
+    if scan.get("executionStatus") == "incomplete":
+        require(summary.get("gate", {}).get("status") in {"failed", "indeterminate"}, "Incomplete scans must not have a passed gate.")
     require(all(finding.get("schemaVersion") == 2 for finding in findings), "Finding schema markers are inconsistent.")
     require(all(remediation.get("schemaVersion") == 2 for remediation in remediations), "Remediation schema markers are inconsistent.")
     if component_inventory is None:

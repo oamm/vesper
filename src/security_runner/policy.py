@@ -16,7 +16,9 @@ def evaluate(
     reasons: list[str] = []
     gated = sorted(severity for severity in fail_on if severity in counts and counts[severity])
     if gated:
-        reasons.append(f"Findings at configured severities: {', '.join(gated)}")
+        details = ", ".join(f"{counts[severity]} {severity}-severity" for severity in gated)
+        noun = "finding violates" if sum(counts[severity] for severity in gated) == 1 else "findings violate"
+        reasons.append(f"{details} {noun} the configured policy")
     secrets = sum(1 for finding in findings if finding["category"] == "secret")
     if policy.get("failOnSecrets", False) and secrets:
         reasons.append(f"{secrets} secret finding(s) detected")
