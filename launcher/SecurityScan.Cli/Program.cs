@@ -317,6 +317,11 @@ internal static class Program
             Console.Error.WriteLine("[report] Baseline comparison artifacts are missing or inconsistent.");
             return 2;
         }
+        if (!ValidateSavedArtifacts(reportDirectory, scanRoot, root))
+        {
+            Console.Error.WriteLine("[report] Saved report artifacts are missing, malformed, or inconsistent.");
+            return 2;
+        }
         if (command == "gate")
         {
             Console.WriteLine("Vesper Security Gate");
@@ -465,6 +470,53 @@ internal static class Program
                 .SequenceEqual(scanDelta.GetProperty("failOnNew").EnumerateArray().Select(item => item.GetString()))
             && summaryDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString())
                 .SequenceEqual(scanDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString()));
+    }
+
+    private static bool ValidateSavedArtifacts(string reportDirectory, JsonElement scan, JsonElement summary)
+    {
+        try
+        {
+            if (!scan.TryGetProperty("reportSchemas", out var schemas) || schemas.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (var schema in schemas.EnumerateObject())
+            {
+                var required = schema.Name is "project" or "scan" or "findings" or "remediations" or "summary"
+                    || schema.Name is "components" or "posture" or "comparison";
+                if (!required) continue;
+                var file = Path.Combine(reportDirectory, schema.Name + ".json");
+                if (!File.Exists(file)) return false;
+                using var document = JsonDocument.Parse(File.ReadAllText(file));
+                if (schema.Name == "components" && (!document.RootElement.TryGetProperty("schemaVersion", out var componentVersion) || componentVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("components", out var components) || components.ValueKind != JsonValueKind.Array)) return false;
+                if (schema.Name == "posture" && (!document.RootElement.TryGetProperty("schemaVersion", out var postureVersion) || postureVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("checks", out var checks) || checks.ValueKind != JsonValueKind.Array)) return false;
+            }
+
+            if (scan.TryGetProperty("scanners", out var scanners))
+            {
+                if (scanners.ValueKind != JsonValueKind.Array) return false;
+                foreach (var scanner in scanners.EnumerateArray())
+                {
+                    if (!scanner.TryGetProperty("rawOutput", out var raw) || raw.ValueKind != JsonValueKind.String) return false;
+                    var relative = raw.GetString() ?? "";
+                    if (!relative.StartsWith("raw/", StringComparison.Ordinal) || relative.Contains("..", StringComparison.Ordinal) || Path.IsPathRooted(relative)) return false;
+                    var root = Path.GetFullPath(reportDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                    var path = Path.GetFullPath(Path.Combine(reportDirectory, relative.Replace('/', Path.DirectorySeparatorChar)));
+                    if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(path)) return false;
+                }
+            }
+
+            var findingsPath = Path.Combine(reportDirectory, "findings.json");
+            using var findingsDocument = JsonDocument.Parse(File.ReadAllText(findingsPath));
+            if (findingsDocument.RootElement.ValueKind != JsonValueKind.Array) return false;
+            if (summary.TryGetProperty("findings", out var findingSummary) && findingSummary.TryGetProperty("total", out var total) && total.GetInt32() != findingsDocument.RootElement.GetArrayLength()) return false;
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or JsonException or InvalidOperationException or ArgumentException)
+        {
+            return false;
+        }
     }
 
     private static string? TextProperty(JsonElement element, string name)

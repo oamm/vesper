@@ -488,6 +488,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         arguments.AddRange([
             "--env", $"SECURITY_SCAN_ID={execution.ScanIdText}",
             "--env", $"SECURITY_SCAN_STARTED_AT={execution.StartedAtText}",
+            "--env", $"SECURITY_SCAN_INCLUDE_GIT={(options.IncludeGit ? "true" : "false")}",
             "--read-only", "--tmpfs", "/tmp",
             "--security-opt=no-new-privileges", "--cap-drop=ALL",
             $"--cpus={options.ResourceLimits.Cpus}",

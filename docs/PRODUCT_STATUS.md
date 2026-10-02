@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-10-02
 **Current version:** 0.2.0
-**Current milestone:** M3 - Artifact and Supply Chain Security (IN PROGRESS)
-**Overall status:** IN PROGRESS
+**Current milestone:** M4 - API Security and Fuzzing (PLANNED)
+**Overall status:** M3 COMPLETE; M4 PLANNED
 
 ## Product Goal
 
@@ -17,8 +17,8 @@ Developer / CI
        -> Docker CLI and selected context
           -> one ephemeral vesper-runner container per scan
              -> Python orchestration and project detection
-             -> Trivy / OSV-Scanner / Semgrep / Syft / Grype
-             -> normalization / deduplication / remediation groups / policy / reports
+             -> Trivy / OSV-Scanner / Semgrep / Syft / Grype / Gitleaks / Scorecard
+             -> normalization / posture evidence / deduplication / remediation groups / policy / reports
 ```
 
 - The launcher owns Docker context selection, host paths, source/result transport, per-scan resources, process control, and exit-code forwarding.
@@ -30,12 +30,12 @@ Developer / CI
 
 ## Current Capabilities
 
-- Scanner image: Trivy 0.58.2, OSV-Scanner 2.3.3, Semgrep 1.99.0, Syft 1.52.0, Grype 0.119.0; image default is `vesper-runner:0.2.0`.
+- Scanner image: Trivy 0.58.2, OSV-Scanner 2.3.3, Semgrep 1.99.0, Syft 1.52.0, Grype 0.119.0, Gitleaks 8.30.1, and OpenSSF Scorecard 5.5.0; image default is `vesper-runner:0.2.0`.
 - Host CLI: .NET 10 Native AOT; Windows `win-x64` and Linux `linux-x64` have been published and runtime-tested.
 - Docker endpoint classification supports npipe, Unix socket, SSH, loopback and remote TCP/HTTP(S); Docker calls are pinned to the context/host selected at scan start.
 - Local bind and remote volume workspace modes; source archives exclude common generated directories and enforce byte/file/per-file ceilings.
 - Scan-specific report directories, labeled Docker resources, bounded Docker operation timeouts, runner limits, fail-closed execution completeness, and per-scan cleanup.
-- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts. M3.1 additionally emits a versioned `components.json` inventory and compact component summary. A completed scan can create a versioned `baseline.json`; scans with a baseline emit a separate `comparison.json` without mutating current findings.
+- Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts. M3.1 additionally emits a versioned `components.json` inventory and compact component summary; M3.4 emits a separate versioned `posture.json` artifact when Scorecard is applicable. A completed scan can create a versioned `baseline.json`; scans with a baseline emit a separate `comparison.json` without mutating current findings.
 - Scanner execution status is separate from coverage assessment and policy gate; `unsupported_manifest` is explicit and cannot be treated as clean. Reports use schema v2 and validate internal totals/references before writing final JSON.
 
 ## Milestones
@@ -280,11 +280,11 @@ M3.1 SBOM Foundation                    COMPLETE
      Syft
 M3.2 Artifact Vulnerability Analysis    COMPLETE
      Grype
-M3.3 Repository Secret History          PLANNED
+M3.3 Repository Secret History          COMPLETE
      Gitleaks
-M3.4 Supply Chain Posture                PLANNED
+M3.4 Supply Chain Posture                COMPLETE
      OpenSSF Scorecard
-M3.5 M3 Integration and Acceptance      PLANNED
+M3.5 M3 Integration and Acceptance      COMPLETE
 ```
 
 #### M3.2 - Artifact Vulnerability Analysis
@@ -304,6 +304,50 @@ The final database-backed Lynx scan used source fallback through the trusted rem
 The four OSV/Trivy-vulnerable packages associated with `Invoice/packages.config` remain absent from the Syft SBOM and consequently absent from Grype's input. This is consistent with Syft cataloging the repository's lockfile/package sources rather than that legacy packages.config input. Grype cannot claim coverage for those packages; its report records `analysisStatus: completed` but `inputAssessment: unknown` and overall coverage `unknown`. The finding set remains the independent OSV/Trivy evidence, not a claim of SBOM completeness.
 
 The real vulnerable fixture acceptance used the existing npm `minimist@0.0.8` fixture with the live Syft and Grype engines under the explicit 6 GiB limit. Scan `ab6650a1-9bf6-49b2-97fd-f9fd53872a77` emitted the component `pkg:npm/minimist@0.0.8` at `package-lock.json`; Grype produced `GHSA-xvch-5gv4-984h` (CRITICAL, fixed `0.2.4`) and `GHSA-vh95-rmgr-6w4m` (MEDIUM, fixed `0.2.1`). Each normalized finding retained its component ID, PURL, occurrence, native Grype evidence, database metadata, and existing remediation selection. OSV and Trivy corroborated both findings, producing one semantic finding per vulnerability with detector sets `grype`, `osv-scanner`, and `trivy`. The fixture scan completed with 39 findings and 38 remediations; baseline `baseline-5ffffdf8e8f05961615f6120ea571999073d0dc790ac3b6e4e735ab5bd2f8ac7` and unchanged scan `0c18c2e6-be56-4479-bdec-59edf905da86` recorded `NEW=0`, `EXISTING=39`, `CHANGED=0`, `RESOLVED=0`, and `UNVERIFIED=0`. The four-package Lynx `packages.config` gap remains a documented input-coverage limitation.
+
+#### M3.3 - Repository Secret History
+
+**Status:** COMPLETE
+
+Gitleaks 8.30.1 is pinned to the official Linux x64 release archive and verified against the published checksum during image build. The release is MIT licensed. The isolated adapter uses Gitleaks `git` history mode with `--redact`, `--log-opts=--all`, JSON output, and an explicit exit code. It does not silently use working-tree scanning as a substitute for history scanning. The runner image includes the Git executable required by Gitleaks and passes a process-scoped `safe.directory=/workspace` setting because staged remote volumes are owned by a different transport user.
+
+Git history scanning is opt-in through `--include-git`. Remote volume transport includes `.git` only for that option; default archive exclusions remain unchanged. The representative fixture transferred 46 files, including approximately 40 KB of Git metadata, and Gitleaks completed in about 0.9 seconds. Local bind mode still exposes the workspace normally, but the runner receives the same explicit capability flag, so a mounted `.git` directory is not traversed accidentally.
+
+Gitleaks native JSON is retained at `raw/gitleaks.json` after redacting `Match`, `Secret`, line-content/fragments, diffs, and fingerprints. Normalized findings record only rule, repository-relative file, line, commit, date, and a generic rotation/removal message. Historical scope is explicit (`currentPresence: unknown`); plaintext secrets, author/email metadata, and native secret values are not copied into normalized reports, logs, summaries, baselines, comparisons, or HTML.
+
+Coverage records whether Git metadata was requested and available, whether history is complete or shallow, and whether traversal completed. Missing `.git` or omitted `--include-git` is `not_applicable`; shallow history is `partial`. Neither condition is clean-history evidence. A history-only baseline finding cannot become `RESOLVED` when history is unavailable. Gitleaks failures preserve independent scanner evidence and make execution incomplete/assessment indeterminate under existing fail-closed rules.
+
+The remote acceptance fixture contained deleted AWS/private-key material in reachable commits while the current working tree was clean. Scan `6237e7ee-06b2-4571-bfce-3b7828f00421` completed with two historical-only findings, two remediations, and a failed secret policy gate; raw output contained redacted native fields only. An unchanged rerun with baseline `baseline-a721fe240b2314d8ccc3e59be1cd92ab4836c2dd5e350477d23e33de3f0670eb` recorded `NEW=0`, `EXISTING=2`, `CHANGED=0`, `RESOLVED=0`, and `UNVERIFIED=0`. The generated HTML report contained neither the fixture secret nor a raw secret value. This is representative acceptance evidence; Lynx is a separate regression and is not required to contain secrets.
+
+Focused tests cover explicit applicability, redacted native output, commit-stable identity, history provenance, and list-shaped Gitleaks output. The runner image build and remote volume scan passed. Current limitations are conservative current-vs-historical correlation, no recursive nested-repository traversal, and no claim of complete history for shallow or unavailable Git metadata.
+
+#### M3.4 - Supply Chain Posture
+
+**Status:** COMPLETE
+
+OpenSSF Scorecard `v5.5.0` is pinned to the official Linux amd64 release archive and verified against `scorecard_checksums.txt` during the runner image build. The release is Apache-2.0 licensed. Vesper invokes Scorecard's explicit local mode only when `--include-git` is requested and Git metadata is present; it does not silently require or perform provider API access.
+
+Scorecard native JSON is retained at `raw/scorecard.json`. The normalized `posture.json` schema v1 keeps repository identity, native aggregate/check scores, check-specific reason/documentation/evidence, evidence source, and explicit states (`PASS`, `FAIL`, `WARN`, `UNKNOWN`, `NOT_APPLICABLE`, `ERROR`). Scorecard's native `-1` check result is `NOT_APPLICABLE`, not a posture failure. Posture evidence is separate from `findings.json`, severity, baseline comparison, and the security gate.
+
+Repository origin normalization strips credentials and normalizes common GitHub HTTPS/SSH forms. Local-only repositories remain usable: without explicit Git transport Scorecard is `not_applicable`, never clean or PASS. Local mode reports partial posture coverage because provider-backed checks were not evaluated; missing provider evidence is not treated as success. Scorecard failures remain scanner failures under the existing fail-closed execution behavior while independent findings are preserved.
+
+The real acceptance used a controlled Git fixture through the remote Docker volume path with `--include-git`, runner image `vesper-runner:m34`, and the live Scorecard binary. Final scan `362740ca-2642-42b4-bd2a-8d8ffb17f354` completed in approximately 0.6 seconds with a 4,474-byte raw Scorecard artifact, native aggregate score `3.8`, and 11 normalized checks: 2 PASS, 5 FAIL, and 4 NOT_APPLICABLE. The fixture was local-only, so provider-backed checks were not evaluated and posture coverage was `partial`.
+
+The HTML report includes a posture section with repository identity, aggregate score, coverage, check state, score, reason, evidence source, and a `posture.json` artifact link. Scorecard scores are displayed as posture metadata only; they do not fail the gate. No provider credentials or unnecessary personal metadata are persisted. Deterministic tests cover valid/invalid envelopes, URL credential sanitization, ordering, state counts, report invariants, and posture HTML rendering. Posture comparison or policy projection remains outside M3 and is deferred to later policy work.
+
+#### M3.5 - M3 Integration and Acceptance
+
+**Status:** COMPLETE
+
+M3.5 validated the complete seven-engine M3 pipeline without adding a scanner: Trivy, OSV-Scanner, Semgrep, Syft, Grype, Gitleaks, and OpenSSF Scorecard. The integrated fixture scan `2e40dc31-690d-41f8-b346-b1393f4bb654` and unchanged baseline rerun `579bd4aa-5219-424d-a061-fee629212ec0` completed through remote Docker volume transport with `--include-git` and an explicit `--memory 6g` limit. The rerun produced 39 findings and 38 remediations; the comparison was `NEW=0`, `EXISTING=39`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`. Components, findings, remediations, posture, scanner metadata, raw artifacts, and summary totals passed cross-artifact validation. The baseline ID was `baseline-fb89eeefbbe1fa34a8422b53e47157f5538f4ea52ef654c8b6d9f318f245847b`.
+
+The integrated fixture's compact inventory, raw evidence, normalized findings, remediations, posture, and HTML were independently validated. The real Lynx acceptance scan `7465adc4-bc2b-4539-8cd7-4ab14900ba6a` completed all seven scanners in 163.3 seconds with 49 findings, 23 remediations, 596 components, and 17,431 occurrences. Syft completed in 12.2 seconds; Grype completed in 91.0 seconds with valid database-backed metadata and no Lynx matches; Gitleaks produced 18 historical-scope findings; Scorecard produced 11 local checks with partial coverage. Semgrep completed with partial coverage and 24 parse errors; Trivy coverage remained unknown; OSV coverage completed. The existing policy gate failed on three HIGH findings and 18 secret findings while execution remained `completed`.
+
+The report set uses versioned schemas: report artifacts v2, baseline v1, comparison v1, components v1, and posture v1. `vesper report`, `vesper report --html`, and saved `vesper gate` reproduced the Lynx result; saved report returned 0 and saved gate returned 1. Corrupting `posture.json` in a temporary copy caused saved gate validation to fail closed with exit 2. HTML exposed separate execution, gate, coverage, findings, remediations, components/SBOM, historical-secret, posture, and artifact sections. Secret values were not present in the Lynx HTML, and links were report-relative without `file://` or parent traversal.
+
+Failure isolation remained explicit: Syft failure prevents normal Grype execution rather than producing a clean result; Grype failure preserves Syft and independent findings; Gitleaks failure preserves dependency evidence; and Scorecard failure preserves security findings. The existing 4 GiB bounded default and explicit 6 GiB override remain intentional; the large Lynx workload used 6 GiB after the documented 4 GiB memcg OOM evidence. The known `Invoice/packages.config` limitation remains unchanged: OSV/Trivy can detect packages absent from Syft, so Grype coverage cannot exceed the Syft inventory.
+
+M3 exit criteria are complete: each M3 slice has accepted evidence; the integrated fixture and unchanged baseline pass; coverage loss remains conservative; scanner dependency/failure behavior is fail-closed; all M3 evidence renders safely in HTML; saved report/gate reproduction works; 81 Python tests pass; launcher acceptance passes; and a fresh `vesper-runner:m35` image build succeeds. Dynamic Trivy, OSV, Grype, Semgrep, and provider/posture intelligence remain external reproducibility inputs rather than normalization nondeterminism.
 
 ### M4 - API Security and Fuzzing
 
@@ -507,12 +551,12 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 ## Deferred Work
 
-- M3.3-M9 deterministic security, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred. Large artifact/SBOM scans may require an explicit memory override above the bounded 4 GiB default.
+- M4-M9 API, runtime, infrastructure, correlation, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred. Large artifact/SBOM scans may require an explicit memory override above the bounded 4 GiB default.
 - Additional scanners, shared scanner caches, and an orphan cleanup command remain future work.
 
 ## Not Implemented Yet
 
-- Gitleaks integration, OpenSSF Scorecard integration, Schemathesis, OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service.
+- Schemathesis, OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service remain unimplemented.
 
 ## Product Readiness
 
@@ -528,7 +572,7 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 1. Preserve the completed M2 baseline/diff and new-finding gate evidence while monitoring dynamic scanner data changes.
 2. Keep macOS runtime/AOT and real Docker daemon-disappearance verification as explicit environment/platform validation work.
-3. Preserve the completed M3.2 evidence and keep M3.3 planned; do not begin M3.3 in this acceptance task.
+3. Begin M4 API Security and Fuzzing only after explicit authorization; this status update does not start M4.
 4. Do not begin CI/CD ecosystem packaging until M9 unless a small CI smoke test is required to validate an earlier product invariant.
 
 ## Future Development Workflow
@@ -561,3 +605,6 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 - Hardened the HTML export for schema-v2 scanner coverage objects and structured coverage warnings after validating it against the Lynx report with 31 findings and 5 remediations; the export now completes without an unhandled exception.
 - Expanded the HTML report with independent execution/gate/coverage assessments, effective policy metadata, prioritized remediations, scanner scope and diagnostics, safe artifact links, escaped expandable finding evidence, offline filters, and reproducibility metadata. Added additive schema-v2 `coverage.assessment`, `effectivePolicy`, project identity, and optional launcher-captured Git metadata. Known policy blockers now remain a failed decision when execution is incomplete, while scan and saved-gate exit code `2` semantics remain intact.
 - Removed the obsolete legacy Docker image tag from the documented build surface; `vesper-runner` is the only supported runner image name. The `security_runner` Python package and `security-scan` script aliases remain unchanged.
+- Completed M3.3 Repository Secret History with pinned/checksum-verified Gitleaks 8.30.1, explicit `--include-git` transport, process-scoped Git ownership trust, redacted native evidence, historical-only fixture acceptance, unchanged baseline comparison, and HTML redaction verification. The Git executable is now an explicit runner dependency; M3.4 remains planned.
+- Completed M3.4 Supply Chain Posture with pinned/checksum-verified OpenSSF Scorecard v5.5.0, explicit local Git mode, versioned `posture.json`, provider-limited coverage semantics, sanitized repository identity, raw evidence retention, posture HTML rendering, and live remote-volume fixture acceptance. Scorecard posture remains separate from findings and the security gate; M3.5 remains planned.
+- Completed M3.5 M3 Integration and Acceptance with the seven-engine integrated fixture, unchanged baseline comparison, real Lynx regression, cross-artifact validation, scanner failure-isolation checks, safe components/secrets/posture HTML sections, saved report/gate reproduction, corrupt-artifact exit-2 handling, 81 Python tests, launcher acceptance, and a rebuilt `vesper-runner:m35` image. M3 is complete; M4 remains planned and was not started.

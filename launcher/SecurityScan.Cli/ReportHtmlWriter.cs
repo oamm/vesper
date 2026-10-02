@@ -15,6 +15,8 @@ internal static class ReportHtmlWriter
         using var findings = Load(reportDirectory, "findings.json");
         using var remediations = Load(reportDirectory, "remediations.json");
         using var project = LoadOptional(reportDirectory, "project.json");
+        using var posture = LoadOptional(reportDirectory, "posture.json");
+        using var components = LoadOptional(reportDirectory, "components.json");
         var scanRoot = scan.RootElement;
         var gate = summary.TryGetProperty("gate", out var gateValue) ? gateValue : EmptyObject;
         var findingSummary = summary.TryGetProperty("findings", out var nestedFindings) ? nestedFindings : summary;
@@ -29,6 +31,9 @@ internal static class ReportHtmlWriter
         AppendComparison(html, comparisonCounts);
         AppendRemediations(html, remediations.RootElement, blockingIds);
         AppendCoverage(html, reportDirectory, outputPath, summary, scanRoot, project);
+        AppendComponents(html, components?.RootElement ?? EmptyObject, summary);
+        AppendSecretHistory(html, findings.RootElement, reportDirectory, outputPath);
+        AppendPosture(html, posture?.RootElement ?? EmptyObject);
         AppendFindings(html, findings.RootElement, remediations.RootElement, blockingIds);
         AppendReproducibility(html, reportDirectory, outputPath, scanRoot, summary);
         html.Append("</main>");
@@ -155,6 +160,52 @@ internal static class ReportHtmlWriter
         html.Append("</section>");
     }
 
+    private static void AppendPosture(StringBuilder html, JsonElement posture)
+    {
+        if (posture.ValueKind != JsonValueKind.Object) return;
+        html.Append("<section aria-labelledby=\"posture-heading\"><h2 id=\"posture-heading\">Repository supply-chain posture</h2>");
+        html.Append("<p class=\"muted\">Posture evidence is separate from vulnerability findings and does not change the security gate in this milestone.</p><div class=\"cards\">");
+        Card(html, "Repository", Text(posture, "repository.origin", Text(posture, "repository.provider", "local")));
+        Card(html, "Scorecard score", Text(posture, "scorecard.score", "Not recorded"));
+        Card(html, "Coverage", Text(posture, "coverage.assessment", "unknown"));
+        Card(html, "Checks", Text(posture, "counts.pass", "0") + " pass / " + Text(posture, "counts.fail", "0") + " fail / " + Text(posture, "counts.unknown", "0") + " unknown");
+        html.Append("</div><div class=\"table-wrap\"><table><thead><tr><th>Check</th><th>State</th><th>Score</th><th>Reason</th><th>Evidence source</th></tr></thead><tbody>");
+        if (posture.TryGetProperty("checks", out var checks) && checks.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var check in checks.EnumerateArray())
+            {
+                var state = Text(check, "state", "UNKNOWN");
+                html.Append("<tr><th scope=\"row\">").Append(E(Text(check, "name", "Unknown check"))).Append("</th><td><span class=\"status ").Append(E(state.ToLowerInvariant())).Append("\">").Append(E(state)).Append("</span></td><td>").Append(E(Text(check, "score", "Not recorded"))).Append("</td><td>").Append(E(Text(check, "reason", "Not recorded"))).Append("</td><td>").Append(E(Text(check, "evidenceSource", "unknown"))).Append("</td></tr>");
+            }
+        }
+        html.Append("</tbody></table></div><p class=\"muted\">Provider-backed checks unavailable in local mode are represented by the coverage assessment; missing evidence is never treated as PASS.</p></section>");
+    }
+
+    private static void AppendComponents(StringBuilder html, JsonElement components, JsonElement summary)
+    {
+        if (components.ValueKind != JsonValueKind.Object) return;
+        html.Append("<section aria-labelledby=\"components-heading\"><h2 id=\"components-heading\">Component inventory / SBOM</h2><p class=\"muted\">Components are inventory evidence, not vulnerability findings. Grype analysis is bounded by this inventory.</p><div class=\"cards\">");
+        Card(html, "Unique components", Text(summary, "components.unique", Text(summary, "components.total", "0")));
+        Card(html, "Occurrences", Text(summary, "components.occurrences", "0"));
+        Card(html, "Ecosystems", JoinArray(summary, "components.ecosystems"));
+        Card(html, "Schema", Text(components, "schemaVersion", "Not recorded"));
+        html.Append("</div><p class=\"muted\">The complete normalized inventory is available as <span class=\"code\">components.json</span>; native SBOM evidence remains linked from scanner coverage.</p></section>");
+    }
+
+    private static void AppendSecretHistory(StringBuilder html, JsonElement findings, string reportDirectory, string outputPath)
+    {
+        if (findings.ValueKind != JsonValueKind.Array) return;
+        var secrets = findings.EnumerateArray().Where(item => Text(item, "category") == "secret").ToArray();
+        if (secrets.Length == 0 && !File.Exists(Path.Combine(reportDirectory, "raw", "gitleaks.json"))) return;
+        var historical = secrets.Count(item => Text(item, "secretEvidence.scope") == "historical");
+        var current = secrets.Count(item => Text(item, "secretEvidence.scope") == "current");
+        html.Append("<section aria-labelledby=\"secret-history-heading\"><h2 id=\"secret-history-heading\">Repository secret history</h2><p class=\"muted\">Gitleaks history evidence is kept separate from current-content secret evidence. Secret values are redacted from this report.</p><div class=\"cards\">");
+        Card(html, "Secret findings", secrets.Length.ToString());
+        Card(html, "Historical", historical.ToString());
+        Card(html, "Current", current.ToString());
+        html.Append("</div><p><strong>Native evidence:</strong> ").Append(ArtifactLink(reportDirectory, outputPath, "raw/gitleaks.json")).Append("</p></section>");
+    }
+
     private static void AppendFindings(StringBuilder html, JsonElement findings, JsonElement remediations, HashSet<string> blockingIds)
     {
         html.Append("<section id=\"findings\" aria-labelledby=\"findings-heading\"><h2 id=\"findings-heading\">Findings</h2><div class=\"toolbar\"><label>Search <input id=\"finding-search\" type=\"search\" placeholder=\"title, package, path, ID\"></label><label>Severity <select id=\"finding-severity\"><option value=\"\">All</option>");
@@ -212,7 +263,7 @@ internal static class ReportHtmlWriter
         Row(html, "Runner image digest", Text(scan, "runnerImageDigest", "Not recorded"), true);
         Row(html, "Ruleset / database metadata", Text(scan, "reproducibilityMetadata", "Not recorded"));
         html.Append("</tbody></table></div><p><strong>Artifacts:</strong> ");
-        foreach (var artifact in new[] { "project.json", "scan.json", "summary.json", "findings.json", "remediations.json", "components.json", "comparison.json" }) if (File.Exists(Path.Combine(reportDirectory, artifact))) html.Append(ArtifactLink(reportDirectory, outputPath, artifact)).Append(" ");
+        foreach (var artifact in new[] { "project.json", "scan.json", "summary.json", "findings.json", "remediations.json", "components.json", "posture.json", "comparison.json" }) if (File.Exists(Path.Combine(reportDirectory, artifact))) html.Append(ArtifactLink(reportDirectory, outputPath, artifact)).Append(" ");
         html.Append("</p></section>");
     }
 
