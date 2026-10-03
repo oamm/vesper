@@ -21,6 +21,12 @@ public sealed record LaunchOptions(
     int ApiMaxRequests,
     double ApiRequestTimeout,
     double ApiGlobalTimeout,
+    string? RuntimeTarget,
+    bool EnablePassiveRuntimeAnalysis,
+    bool EnableActiveDast,
+    string? RuntimeAuthMode,
+    string? RuntimeAuthEnvironment,
+    string? RuntimeAuthHeader,
     ScanResourceLimits ResourceLimits,
     WorkspaceTransferLimits TransferLimits);
 
@@ -579,6 +585,38 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
                 arguments.Add("--env");
                 arguments.Add(options.ApiKeyEnvironment);
             }
+        }
+        if (options.RuntimeTarget is not null)
+        {
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_RUNTIME_TARGET={options.RuntimeTarget}");
+        }
+        if (options.EnablePassiveRuntimeAnalysis)
+        {
+            arguments.Add("--env");
+            arguments.Add("SECURITY_SCAN_ENABLE_PASSIVE_RUNTIME_ANALYSIS=true");
+        }
+        if (options.EnableActiveDast)
+        {
+            arguments.Add("--env");
+            arguments.Add("SECURITY_SCAN_ENABLE_ACTIVE_DAST=true");
+        }
+        if (options.RuntimeAuthMode is not null)
+        {
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_RUNTIME_AUTH_MODE={options.RuntimeAuthMode}");
+        }
+        if (options.RuntimeAuthEnvironment is not null)
+        {
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_RUNTIME_AUTH_ENV={options.RuntimeAuthEnvironment}");
+            arguments.Add("--env");
+            arguments.Add(options.RuntimeAuthEnvironment);
+        }
+        if (options.RuntimeAuthHeader is not null)
+        {
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_RUNTIME_AUTH_HEADER={options.RuntimeAuthHeader}");
         }
         return arguments;
     }

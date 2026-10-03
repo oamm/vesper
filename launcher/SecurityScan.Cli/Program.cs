@@ -140,6 +140,12 @@ internal static class Program
         var apiMaxRequests = 20;
         var apiRequestTimeout = 10d;
         var apiGlobalTimeout = 60d;
+        string? runtimeTarget = null;
+        var enablePassiveRuntimeAnalysis = false;
+        var enableActiveDast = false;
+        string? runtimeAuthMode = null;
+        string? runtimeAuthEnvironment = null;
+        string? runtimeAuthHeader = null;
         var cpus = ScanResourceLimits.Default.Cpus;
         var memory = ScanResourceLimits.Default.Memory;
         var pidsLimit = ScanResourceLimits.Default.PidsLimit.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -190,6 +196,12 @@ internal static class Program
                 case "--api-max-requests": apiMaxRequests = ParseApiInt(Value(), "--api-max-requests", 1, 1000); break;
                 case "--api-request-timeout": apiRequestTimeout = ParseApiDouble(Value(), "--api-request-timeout", 0.1, 300); break;
                 case "--api-timeout": apiGlobalTimeout = ParseApiDouble(Value(), "--api-timeout", 0.1, 3600); break;
+                case "--runtime-target": runtimeTarget = Value(); break;
+                case "--enable-passive-runtime-analysis": enablePassiveRuntimeAnalysis = true; break;
+                case "--enable-active-dast": enableActiveDast = true; break;
+                case "--runtime-auth-mode": runtimeAuthMode = Value().ToLowerInvariant(); break;
+                case "--runtime-auth-env": runtimeAuthEnvironment = Value(); break;
+                case "--runtime-auth-header": runtimeAuthHeader = Value(); break;
                 case "--image": image = Value(); break;
                 case "--cpus": cpus = Value(); break;
                 case "--memory": memory = Value(); break;
@@ -233,6 +245,26 @@ internal static class Program
                 throw new ArgumentException("--api-target must be an absolute http/https URL without credentials, query, or fragment data.");
             }
         }
+        if ((enablePassiveRuntimeAnalysis || enableActiveDast) && runtimeTarget is null)
+            throw new ArgumentException("--runtime-target is required when passive or active runtime analysis is enabled.");
+        if (runtimeAuthMode is not null && runtimeAuthMode is not ("none" or "bearer" or "api_key" or "cookie_session" or "static_headers"))
+            throw new ArgumentException("--runtime-auth-mode must be none, bearer, api_key, cookie_session, or static_headers.");
+        if (runtimeAuthMode is not null and not "none" && runtimeAuthEnvironment is null)
+            throw new ArgumentException("--runtime-auth-env is required for configured runtime authentication.");
+        if (runtimeAuthMode == "api_key" && runtimeAuthHeader is null)
+            throw new ArgumentException("--runtime-auth-header is required for api_key runtime authentication.");
+        if (runtimeTarget is not null)
+        {
+            if (!Uri.TryCreate(runtimeTarget, UriKind.Absolute, out var parsedRuntimeTarget)
+                || parsedRuntimeTarget.Scheme is not ("http" or "https")
+                || !string.IsNullOrEmpty(parsedRuntimeTarget.UserInfo)
+                || !string.IsNullOrEmpty(parsedRuntimeTarget.Query)
+                || !string.IsNullOrEmpty(parsedRuntimeTarget.Fragment)
+                || string.IsNullOrWhiteSpace(parsedRuntimeTarget.Host))
+            {
+                throw new ArgumentException("--runtime-target must be an absolute http/https URL without credentials, query, or fragment data.");
+            }
+        }
 
         return new LaunchOptions(
             Path.GetFullPath(workspace ?? "."),
@@ -255,6 +287,12 @@ internal static class Program
             apiMaxRequests,
             apiRequestTimeout,
             apiGlobalTimeout,
+            runtimeTarget,
+            enablePassiveRuntimeAnalysis,
+            enableActiveDast,
+            runtimeAuthMode,
+            runtimeAuthEnvironment,
+            runtimeAuthHeader,
             ScanResourceLimits.Parse(cpus, memory, pidsLimit),
             WorkspaceTransferLimits.Parse(maxWorkspaceBytes, maxFiles, maxFileBytes, maxOutputBytes, maxOutputFiles, maxEntries));
     }
@@ -299,6 +337,12 @@ internal static class Program
         Console.WriteLine("  --api-max-requests N      Total request ceiling (default: 20)");
         Console.WriteLine("  --api-request-timeout S   Per-request timeout seconds (default: 10)");
         Console.WriteLine("  --api-timeout S           Total API execution timeout seconds (default: 60)");
+        Console.WriteLine("  --runtime-target URL      Explicit passive/active runtime target (M5 foundation only)");
+        Console.WriteLine("  --enable-passive-runtime-analysis  Authorize future passive runtime analysis");
+        Console.WriteLine("  --enable-active-dast      Authorize future active DAST (not executed in M5.1)");
+        Console.WriteLine("  --runtime-auth-mode MODE  none, bearer, api_key, cookie_session, or static_headers");
+        Console.WriteLine("  --runtime-auth-env NAME   Environment variable containing runtime auth");
+        Console.WriteLine("  --runtime-auth-header NAME  API-key header for runtime auth");
         Console.WriteLine("  --include-git             Include .git history in volume staging");
         Console.WriteLine("  --keep-volumes            Keep temporary Docker volumes and print their names");
         Console.WriteLine($"  --image IMAGE             Scanner image (default: {LauncherImages.DefaultRunner})");
@@ -599,12 +643,14 @@ internal static class Program
             foreach (var schema in schemas.EnumerateObject())
             {
                 var required = schema.Name is "project" or "scan" or "findings" or "remediations" or "summary"
-                    || schema.Name is "components" or "posture" or "apiContract" or "apiExecution" or "comparison";
+                    || schema.Name is "components" or "posture" or "apiContract" or "apiExecution" or "runtimeTarget" or "runtimeSurface" or "comparison";
                 if (!required) continue;
                 var fileName = schema.Name switch
                 {
                     "apiContract" => "api-contract.json",
                     "apiExecution" => "api-execution.json",
+                    "runtimeTarget" => "runtime-target.json",
+                    "runtimeSurface" => "runtime-surface.json",
                     _ => schema.Name + ".json",
                 };
                 var file = Path.Combine(reportDirectory, fileName);
@@ -614,6 +660,15 @@ internal static class Program
                 if (schema.Name == "posture" && (!document.RootElement.TryGetProperty("schemaVersion", out var postureVersion) || postureVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("checks", out var checks) || checks.ValueKind != JsonValueKind.Array)) return false;
                 if (schema.Name == "apiContract" && (!document.RootElement.TryGetProperty("schemaVersion", out var apiVersion) || apiVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("operations", out var operations) || operations.ValueKind != JsonValueKind.Array)) return false;
                 if (schema.Name == "apiExecution" && (!document.RootElement.TryGetProperty("schemaVersion", out var executionVersion) || executionVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("operations", out var executionOperations) || executionOperations.ValueKind != JsonValueKind.Array || !document.RootElement.TryGetProperty("contract", out var executionContract) || !executionContract.TryGetProperty("digest", out _))) return false;
+                if (schema.Name == "runtimeTarget")
+                {
+                    if (!ValidateRuntimeTargetArtifact(document.RootElement)) return false;
+                    if (!scan.TryGetProperty("runtimeTarget", out var scanTarget) || scanTarget.ValueKind != JsonValueKind.Object
+                        || !scanTarget.TryGetProperty("target", out var scanTargetIdentity)
+                        || !document.RootElement.TryGetProperty("target", out var artifactTarget)
+                        || !RuntimeTargetMatches(scanTargetIdentity, artifactTarget)) return false;
+                }
+                if (schema.Name == "runtimeSurface" && !ValidateRuntimeSurfaceArtifact(document.RootElement, scan)) return false;
             }
 
             if (scan.TryGetProperty("scanners", out var scanners))
@@ -640,6 +695,52 @@ internal static class Program
         {
             return false;
         }
+    }
+
+    private static bool ValidateRuntimeTargetArtifact(JsonElement artifact)
+    {
+        if (!artifact.TryGetProperty("schemaVersion", out var version) || version.GetInt32() != 1
+            || !artifact.TryGetProperty("target", out var target) || target.ValueKind != JsonValueKind.Object
+            || !target.TryGetProperty("scheme", out var scheme) || scheme.GetString() is not ("http" or "https")
+            || !target.TryGetProperty("host", out var host) || string.IsNullOrWhiteSpace(host.GetString())
+            || !target.TryGetProperty("port", out var port) || !port.TryGetInt32(out var portValue) || portValue is < 1 or > 65535
+            || !target.TryGetProperty("basePath", out var basePath) || basePath.GetString() is null
+            || !artifact.TryGetProperty("authorization", out var authorization) || authorization.ValueKind != JsonValueKind.Object
+            || !artifact.TryGetProperty("scope", out var scope) || scope.ValueKind != JsonValueKind.Object
+            || !artifact.TryGetProperty("authentication", out var authentication) || authentication.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+        var serialized = artifact.GetRawText();
+        return !serialized.Contains("password", StringComparison.OrdinalIgnoreCase)
+            && !serialized.Contains("Authorization:", StringComparison.OrdinalIgnoreCase)
+            && !serialized.Contains("Bearer ", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool RuntimeTargetMatches(JsonElement left, JsonElement right)
+    {
+        foreach (var property in new[] { "scheme", "host", "port", "basePath", "targetId" })
+        {
+            if (!left.TryGetProperty(property, out var leftValue) || !right.TryGetProperty(property, out var rightValue) || leftValue.GetRawText() != rightValue.GetRawText()) return false;
+        }
+        return true;
+    }
+
+    private static bool ValidateRuntimeSurfaceArtifact(JsonElement artifact, JsonElement scan)
+    {
+        if (!artifact.TryGetProperty("schemaVersion", out var version) || version.GetInt32() != 1
+            || !artifact.TryGetProperty("targetId", out var targetId) || targetId.ValueKind != JsonValueKind.String
+            || !artifact.TryGetProperty("resources", out var resources) || resources.ValueKind != JsonValueKind.Array
+            || !artifact.TryGetProperty("summary", out var summary) || summary.ValueKind != JsonValueKind.Object
+            || !scan.TryGetProperty("runtimePassive", out var passive) || passive.ValueKind != JsonValueKind.Object
+            || !passive.TryGetProperty("targetId", out var scanTargetId) || scanTargetId.GetString() != targetId.GetString()) return false;
+        var identities = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var resource in resources.EnumerateArray())
+        {
+            if (!resource.TryGetProperty("identity", out var identity) || identity.ValueKind != JsonValueKind.String || !identities.Add(identity.GetString() ?? "")) return false;
+            if (!resource.TryGetProperty("state", out var state) || state.GetString() is not ("observed" or "auth_limited" or "auth_failed" or "failed" or "out_of_scope")) return false;
+        }
+        return summary.TryGetProperty("discovered", out var discovered) && discovered.GetInt32() == resources.GetArrayLength();
     }
 
     private static string? TextProperty(JsonElement element, string name)

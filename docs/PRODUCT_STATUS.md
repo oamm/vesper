@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-10-02
 **Current version:** 0.2.0
-**Current milestone:** M5 - DAST and Runtime Security (PLANNED)
-**Overall status:** M4 COMPLETE; M5 PLANNED
+**Current milestone:** M5 - DAST and Runtime Security (IN PROGRESS)
+**Overall status:** M4 COMPLETE; M5 IN PROGRESS
 
 ## Product Goal
 
@@ -36,6 +36,7 @@ Developer / CI
 - Local bind and remote volume workspace modes; source archives exclude common generated directories and enforce byte/file/per-file ceilings.
 - Scan-specific report directories, labeled Docker resources, bounded Docker operation timeouts, runner limits, fail-closed execution completeness, and per-scan cleanup.
 - Reports include `project.json`, `scan.json`, `findings.json`, `remediations.json`, `summary.json`, and raw scanner artifacts. M3.1 additionally emits a versioned `components.json` inventory and compact component summary; M3.4 emits a separate versioned `posture.json` artifact when Scorecard is applicable; M4.1 emits a versioned `api-contract.json` artifact for an available local OpenAPI contract. A completed scan can create a versioned `baseline.json`; scans with a baseline emit a separate `comparison.json` without mutating current findings.
+- M5.1 adds an optional secret-safe `runtime-target.json` foundation artifact. It normalizes an explicitly configured HTTP/HTTPS target and same-origin scope, records separate future passive/active authorization, and performs no runtime traffic or scanning. M5.2 adds explicitly authorized, bounded OWASP ZAP 2.17.0 passive observation only; active DAST and Nuclei remain future work.
 - Scanner execution status is separate from coverage assessment and policy gate; `unsupported_manifest` is explicit and cannot be treated as clean. Reports use schema v2 and validate internal totals/references before writing final JSON.
 
 ## Milestones
@@ -432,7 +433,33 @@ The integrated runner acceptance used Scan A `230b348c-578e-48f4-8cdc-748ae04c1c
 
 ### M5 - DAST and Runtime Security
 
-**Status:** PLANNED
+**Status:** IN PROGRESS
+
+M5 is decomposed into M5.1 Runtime Target Foundation, M5.2 Passive Runtime Analysis, M5.3 Active DAST, M5.4 Nuclei Runtime Exposure, M5.5 Runtime Evidence Integration, and M5.6 M5 Integration and Acceptance. M5.1 and M5.2 are implemented in the current milestone; the remaining runtime slices are future work.
+
+#### M5.1 - Runtime Target Foundation
+
+**Status:** COMPLETE
+
+M5.1 adds the passive, scanner-neutral `runtime-target.json` schema v1. Runtime targets accept only clean HTTP/HTTPS URLs, normalize host/port/base-path identity, reject userinfo/query/fragment data, and use a same-origin redirect/link scope. Passive and active runtime authorization are explicit and independent from M4 API authorization; configuring a target does not execute runtime analysis. Authentication metadata records only mode/configured state and environment-variable names, never credential values. The target artifact is validated, linked from `scan.json`, summarized compactly, and rendered in HTML with a configuration-only warning. No ZAP, Nuclei, runtime discovery, runtime findings, or runtime coverage are introduced by M5.1.
+
+#### M5.1 Verification
+
+The passive acceptance covered normalized HTTP/HTTPS identity, default ports, base-path scope, credential/query/fragment rejection, M4/M5 authorization isolation, secret-safe authentication metadata, saved-artifact validation, HTML integration, and an unreachable production-looking target without network access. M5.1 does not contact configured targets and emits no runtime findings. The Python and launcher/build regressions are recorded with the milestone implementation.
+
+#### M5.2 - Passive Runtime Analysis
+
+**Status:** COMPLETE
+
+M5.2 pins OWASP ZAP `2.17.0` from the official Linux release archive, verifies SHA-256 `efe799aaa3627db683b43f00c9c210aea0b75c00cc8f0a0f0434d12bb3ddde5a`, and uses its Apache-2.0 distribution in a private headless passive-only adapter. Passive analysis requires explicit M5 authorization and a runtime target; M4 API authorization does not enable it. Vesper performs bounded ordinary GET observation from the runner, never invokes the active scanner, fuzzer, or form submission, enforces same-origin and base-path scope, blocks cross-origin links and redirects, and records `runtime-surface.json` schema v1 with deterministic resource identities and conservative partial coverage.
+
+The adapter retains bounded redacted `raw/zap-passive.json` evidence and normalizes real ZAP passive alerts into `runtime_passive` findings with deterministic risk-to-severity mapping, runtime-resource linkage, generic remediation, and duplicate semantic identity across repeated observations. Authentication values are injected only at runtime from environment variables and are absent from raw evidence, reports, HTML, and logs. M5.2 does not claim complete web coverage; static HTML discovery is bounded and JavaScript/browser crawling is not implemented.
+
+Real fixture acceptance used a controlled container with seven discovered resource records, six GET requests, one out-of-scope external link, an internal redirect, a blocked cross-origin redirect, authenticated observation, and 19 real ZAP passive alerts. The unauthenticated run classified `/protected` as `auth_limited`; the authenticated run observed it with the synthetic bearer header. The resulting scans produced valid surfaces, findings, remediations, summaries, HTML, and saved-report validation without active attack traffic. The runner image `vesper-runner:m52` built successfully with the verified ZAP archive.
+
+#### M5.3-M5.6 - Remaining M5 slices
+
+Active DAST, Nuclei exposure analysis, runtime evidence integration, and final M5 acceptance remain planned. M5.2 is passive-only; no active runtime scanner has been added.
 
 **Goal:** Analyze running applications and produce deterministic runtime security evidence.
 
@@ -625,7 +652,7 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 ## Not Implemented Yet
 
-- OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service remain unimplemented.
+- OWASP ZAP active scanning, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service remain unimplemented. OWASP ZAP passive observation is implemented in M5.2 only.
 
 ## Product Readiness
 
@@ -682,3 +709,5 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 - Completed M4.3 Behavioral Evidence with deterministic `api_behavior` normalization for unexpected 5xx, response-schema violation, and unexpected-status evidence; target-independent operation fingerprints; multi-case deduplication with bounded redacted reproductions; generic severity/remediation integration; cross-artifact validation; HTML behavioral reporting; explicit exclusion from M2 baseline comparison until M4.4; 93 Python tests; launcher acceptance/build; saved report/HTML/gate reproduction; and a representative real Schemathesis fixture.
 - Completed M4.4 API Coverage and Baseline with additive M2-schema API behavioral baseline entries, target- and generated-value-independent identity, positive operation/behavior-validation resolution evidence, conservative `UNVERIFIED` handling for passive/auth-limited/not-attempted/failed coverage, old-baseline compatibility, mixed finding comparison, saved comparison validation, API baseline HTML details, and 94 passing Python tests. M4.5 remains planned and was not started.
 - Completed M4.5 M4 Integration and Acceptance with the real controlled API fixture, passive/active authorization regressions, runtime coverage and credential-safety checks, deterministic behavioral findings/remediations, integrated baseline rerun, saved report/HTML/gate validation, impossible-resolution rejection, launcher acceptance, runner build, and 95 passing Python tests. M4 is complete; M5 remains planned and was not started.
+- Completed M5.1 Runtime Target Foundation with passive scanner-neutral `runtime-target.json` schema v1, deterministic HTTP/HTTPS identity and same-origin scope, explicit M4/M5 authorization separation, secret-safe authentication metadata, runner/launcher/HTML/saved-validation integration, zero-network production-looking-target acceptance, 102 passing Python tests, launcher acceptance, .NET build, and rebuilt `vesper-runner:m51`. M5.2 passive runtime analysis, ZAP, Nuclei, and runtime scanning were not started.
+- Completed M5.2 Passive Runtime Analysis with checksum-verified OWASP ZAP 2.17.0, explicit passive authorization, bounded same-origin GET observation, real passive alert normalization, `runtime-surface.json` schema v1, redacted native evidence, resource/link/redirect scope enforcement, auth-limited coverage, runtime finding/remediation/HTML/saved-report integration, real fixture acceptance with 19 passive alerts and six requests, 107 passing Python tests, launcher acceptance, .NET build, and rebuilt `vesper-runner:m52`. M5.3 active DAST and later M5 slices remain planned.

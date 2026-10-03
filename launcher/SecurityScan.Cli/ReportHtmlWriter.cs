@@ -7,7 +7,7 @@ namespace Vesper.Cli;
 internal static class ReportHtmlWriter
 {
     private static readonly string[] SeverityValues = ["critical", "high", "medium", "low", "info", "unknown"];
-    private static readonly string[] CategoryValues = ["dependency", "secret", "sast", "iac", "container", "api_behavior"];
+    private static readonly string[] CategoryValues = ["dependency", "secret", "sast", "iac", "container", "api_behavior", "runtime_passive"];
 
     public static void Write(string reportDirectory, string outputPath, JsonElement summary, IReadOnlyDictionary<string, int>? comparisonCounts)
     {
@@ -19,6 +19,8 @@ internal static class ReportHtmlWriter
         using var components = LoadOptional(reportDirectory, "components.json");
         using var apiContract = LoadOptional(reportDirectory, "api-contract.json");
         using var apiExecution = LoadOptional(reportDirectory, "api-execution.json");
+        using var runtimeTarget = LoadOptional(reportDirectory, "runtime-target.json");
+        using var runtimeSurface = LoadOptional(reportDirectory, "runtime-surface.json");
         using var comparison = LoadOptional(reportDirectory, "comparison.json");
         var scanRoot = scan.RootElement;
         var gate = summary.TryGetProperty("gate", out var gateValue) ? gateValue : EmptyObject;
@@ -37,6 +39,8 @@ internal static class ReportHtmlWriter
         AppendComponents(html, components?.RootElement ?? EmptyObject, summary);
         AppendApiContract(html, apiContract?.RootElement ?? EmptyObject, reportDirectory, outputPath);
         AppendApiExecution(html, apiExecution?.RootElement ?? EmptyObject, reportDirectory, outputPath);
+        AppendRuntimeTarget(html, runtimeTarget?.RootElement ?? EmptyObject, reportDirectory, outputPath);
+        AppendRuntimeSurface(html, runtimeSurface?.RootElement ?? EmptyObject, reportDirectory, outputPath);
         AppendApiBehavior(html, findings.RootElement);
         AppendSecretHistory(html, findings.RootElement, reportDirectory, outputPath);
         AppendPosture(html, posture?.RootElement ?? EmptyObject);
@@ -210,6 +214,40 @@ internal static class ReportHtmlWriter
         html.Append("</tbody></table></div><p class=\"muted\">Provider-backed checks unavailable in local mode are represented by the coverage assessment; missing evidence is never treated as PASS.</p></section>");
     }
 
+    private static void AppendRuntimeTarget(StringBuilder html, JsonElement target, string reportDirectory, string outputPath)
+    {
+        if (target.ValueKind != JsonValueKind.Object) return;
+        html.Append("<section aria-labelledby=\"runtime-target-heading\"><h2 id=\"runtime-target-heading\">Runtime target</h2>");
+        html.Append("<p class=\"notice\"><strong>Configuration only:</strong> a configured runtime target does not mean that runtime scanning executed. M5.1 emits no runtime traffic.</p><div class=\"cards\">");
+        Card(html, "Target", Text(target, "target.origin", "Not recorded"));
+        Card(html, "Base path", Text(target, "target.basePath", "/"));
+        Card(html, "Passive authorization", Text(target, "authorization.passive", "false"));
+        Card(html, "Active authorization", Text(target, "authorization.active", "false"));
+        Card(html, "Authentication", Text(target, "authentication.mode", "none") + " (" + Text(target, "authentication.configured", "false") + ")");
+        html.Append("</div><p class=\"muted\"><strong>Scope:</strong> same-origin redirects and link discovery; ").Append(E(Text(target, "scope.paths", "Not recorded"))).Append(". Artifact: ").Append(ArtifactLink(reportDirectory, outputPath, "runtime-target.json")).Append("</p></section>");
+    }
+
+    private static void AppendRuntimeSurface(StringBuilder html, JsonElement surface, string reportDirectory, string outputPath)
+    {
+        if (surface.ValueKind != JsonValueKind.Object) return;
+        html.Append("<section aria-labelledby=\"runtime-surface-heading\"><h2 id=\"runtime-surface-heading\">Passive runtime analysis</h2><p class=\"muted\">Only bounded ordinary runtime observation is represented here. ZAP active scanning and attack payloads are not part of M5.2.</p><div class=\"cards\">");
+        Card(html, "Discovered", Text(surface, "summary.discovered", "0"));
+        Card(html, "Requested", Text(surface, "summary.requested", "0"));
+        Card(html, "Observed", Text(surface, "summary.observed", "0"));
+        Card(html, "Auth limited", Text(surface, "summary.authLimited", "0"));
+        Card(html, "Passive alerts", Text(surface, "summary.alerts", "Not recorded"));
+        Card(html, "Coverage", Text(surface, "summary.assessment", "unknown"));
+        html.Append("</div><div class=\"table-wrap\"><table><thead><tr><th>Method</th><th>Path</th><th>State</th><th>Status</th><th>Source</th></tr></thead><tbody>");
+        if (surface.TryGetProperty("resources", out var resources) && resources.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var resource in resources.EnumerateArray())
+            {
+                html.Append("<tr><td>").Append(E(Text(resource, "method", "GET"))).Append("</td><th scope=\"row\" class=\"code\">").Append(E(Text(resource, "path", "/"))).Append("</th><td>").Append(E(Text(resource, "state", "unknown"))).Append("</td><td>").Append(E(Text(resource, "status", "Not recorded"))).Append("</td><td>").Append(E(Text(resource, "source", "unknown"))).Append("</td></tr>");
+            }
+        }
+        html.Append("</tbody></table></div><p class=\"muted\">Artifact: ").Append(ArtifactLink(reportDirectory, outputPath, "runtime-surface.json")).Append("</p></section>");
+    }
+
     private static void AppendComponents(StringBuilder html, JsonElement components, JsonElement summary)
     {
         if (components.ValueKind != JsonValueKind.Object) return;
@@ -356,7 +394,7 @@ internal static class ReportHtmlWriter
         Row(html, "Runner image digest", Text(scan, "runnerImageDigest", "Not recorded"), true);
         Row(html, "Ruleset / database metadata", Text(scan, "reproducibilityMetadata", "Not recorded"));
         html.Append("</tbody></table></div><p><strong>Artifacts:</strong> ");
-        foreach (var artifact in new[] { "project.json", "scan.json", "summary.json", "findings.json", "remediations.json", "components.json", "api-contract.json", "api-execution.json", "posture.json", "comparison.json" }) if (File.Exists(Path.Combine(reportDirectory, artifact))) html.Append(ArtifactLink(reportDirectory, outputPath, artifact)).Append(" ");
+        foreach (var artifact in new[] { "project.json", "scan.json", "summary.json", "findings.json", "remediations.json", "components.json", "api-contract.json", "api-execution.json", "runtime-target.json", "runtime-surface.json", "posture.json", "comparison.json" }) if (File.Exists(Path.Combine(reportDirectory, artifact))) html.Append(ArtifactLink(reportDirectory, outputPath, artifact)).Append(" ");
         html.Append("</p></section>");
     }
 
