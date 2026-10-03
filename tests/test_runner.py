@@ -14,8 +14,59 @@ from security_runner.policy import evaluate
 from security_runner.remediations import build_remediations
 from security_runner.runner import ReportConsistencyError, _validate_report_consistency, run_scan
 from security_runner.components import normalize_components
+from security_runner.api_contract import ApiContractError, load_contract, normalize_contract
 from security_runner.posture import normalize_repository_identity, normalize_scorecard, validate_scorecard
 from security_runner.scanners import GitleaksScanner, GrypeScanner, OsvScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
+from security_runner.scanners import ApiContractScanner
+
+
+class ApiContractTests(unittest.TestCase):
+    def _config(self):
+        return {
+            "policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None},
+            "baseline": {"failOnNew": ["high"]},
+            "timeouts": {},
+            "scanner": {"trivy": {"enabled": False}, "osv": {"enabled": False}, "sast": {"enabled": False}, "api_contract": {"enabled": True}},
+        }
+
+    def test_normalizes_openapi_yaml_without_network(self):
+        fixture = Path(__file__).parent / "fixtures" / "api-contract"
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            (workspace / "openapi.yaml").write_bytes((fixture / "openapi.yaml").read_bytes())
+            output = Path(temporary) / "output"
+            with patch.dict(os.environ, {"SECURITY_SCAN_API_CONTRACT": "openapi.yaml"}, clear=False):
+                code, _ = run_scan(workspace, output, self._config())
+            contract = json.loads((output / "api-contract.json").read_text(encoding="utf-8"))
+            summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(contract["schemaVersion"], 1)
+            self.assertEqual([item["id"] for item in contract["operations"]], ["GET /health", "GET /loans/{id}", "POST /loans"])
+            self.assertEqual(summary["api"], {"contracts": 1, "operations": 3, "authenticatedOperations": 2, "publicOperations": 1, "unknownSecurityOperations": 0})
+            self.assertEqual(contract["operations"][1]["parameters"][0]["in"], "path")
+            self.assertEqual(contract["operations"][2]["requestBody"]["required"], True)
+
+    def test_missing_contract_is_not_applicable_and_invalid_contract_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            output = workspace / "out"
+            with patch.dict(os.environ, {}, clear=False):
+                result, _ = ApiContractScanner().execute(ScannerContext(workspace, output, output / "raw", detect_project(workspace), 5))
+            self.assertEqual(result.status, "not_applicable")
+            (workspace / "openapi.json").write_text('{"openapi":"2.0","paths":{}}', encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=False):
+                result, _ = ApiContractScanner().execute(ScannerContext(workspace, output, output / "raw", detect_project(workspace), 5))
+            self.assertEqual(result.status, "failed")
+
+    def test_contract_path_cannot_escape_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            outside = Path(temporary) / "openapi.json"
+            outside.write_text('{}', encoding="utf-8")
+            with self.assertRaises(ApiContractError):
+                load_contract(workspace, "../openapi.json")
 
 
 class ScorecardTests(unittest.TestCase):

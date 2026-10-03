@@ -39,6 +39,7 @@ rpds-py==2026.6.3
 ruamel.yaml==0.17.40
 ruamel.yaml.clib==0.2.15
 semgrep==1.99.0
+schemathesis==3.39.16
 tomli==2.0.2
 typing_extensions==4.16.0
 urllib3==2.8.0

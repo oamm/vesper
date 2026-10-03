@@ -33,6 +33,85 @@ def normalize(scanner: str, raw: Any) -> list[dict[str, Any]]:
     return []
 
 
+def normalize_api_behavior(api_execution: dict[str, Any], api_contract: dict[str, Any]) -> list[dict[str, Any]]:
+    """Turn deterministic Schemathesis contract failures into bounded findings."""
+    supported = {"unexpected_5xx", "response_schema_violation", "unexpected_status"}
+    operations = {
+        item.get("id"): item
+        for item in api_contract.get("operations", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    grouped: dict[tuple[str, str, tuple[str, ...]], list[dict[str, Any]]] = {}
+    for event in api_execution.get("events", []):
+        if not isinstance(event, dict) or event.get("classification") not in supported:
+            continue
+        operation_id = str(event.get("operation") or "")
+        if operation_id not in operations:
+            raise ValueError("API behavioral evidence references an unknown contract operation.")
+        operation = operations[operation_id]
+        expected = tuple(sorted(str(item.get("status")) for item in operation.get("responses", []) if isinstance(item, dict)))
+        key = (operation_id, str(event["classification"]), expected)
+        grouped.setdefault(key, []).append(event)
+
+    findings: list[dict[str, Any]] = []
+    for (operation_id, behavior, expected), events in sorted(grouped.items()):
+        events = sorted(events, key=lambda item: (
+            str(item.get("status", "")),
+            str(item.get("path", "")),
+            str(item.get("caseId", "")),
+        ))
+        representative = events[:3]
+        status_values = sorted({str(item.get("status")) for item in events if item.get("status") is not None})
+        severity = "medium" if behavior in {"unexpected_5xx", "response_schema_violation"} else "low"
+        title = {
+            "unexpected_5xx": f"Unexpected 5xx response for {operation_id}",
+            "response_schema_violation": f"Response schema violation for {operation_id}",
+            "unexpected_status": f"Unexpected status response for {operation_id}",
+        }[behavior]
+        expected_text = ", ".join(expected) or "no documented response status"
+        observed_text = ", ".join(status_values) or "unknown status"
+        description = (
+            f"The authorized API execution observed {observed_text} for {operation_id}, "
+            f"while the contract documents {expected_text}. This is runtime behavioral evidence; "
+            "exploitability is not established."
+        )
+        finding = _finding(
+            "api_behavior", behavior, title, description, severity, "schemathesis", behavior,
+            "", None, None, [], [], None, None,
+            f"{behavior} on {operation_id}", behavior,
+            identity_extra="|".join([operation_id, behavior, *expected]),
+        )
+        finding["capability"] = "api_behavior"
+        finding["findingNature"] = "api_behavior"
+        finding["location"] = {"file": "", "operation": operation_id, "line": None, "column": None}
+        finding["description"] = description
+        finding["behaviorEvidence"] = {
+            "contractDigest": api_execution.get("contract", {}).get("digest"),
+            "apiIdentityVersion": api_execution.get("contract", {}).get("apiIdentityVersion"),
+            "operation": operation_id,
+            "behaviorType": behavior,
+            "expectedStatuses": list(expected),
+            "observedStatuses": status_values,
+            "candidateCount": len(events),
+            "retainedEvidenceCount": len(representative),
+            "evidenceTruncated": len(events) > len(representative),
+            "examples": [
+                {
+                    "caseId": _safe_text(item.get("caseId"))[:120],
+                    "method": _safe_text(item.get("method"))[:16],
+                    "path": _redact_behavior_text(item.get("path")),
+                    "status": item.get("status"),
+                    "contentType": _safe_text(item.get("contentType"))[:200],
+                    "check": _redact_behavior_text(item.get("check")),
+                }
+                for item in representative
+            ],
+        }
+        finding["evidence"] = {"message": description, "behavior": behavior, "operation": operation_id}
+        findings.append(finding)
+    return findings
+
+
 def normalize_gitleaks(raw: Any) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for leak in raw if isinstance(raw, list) else []:
@@ -530,3 +609,7 @@ def _safe_text(value: Any) -> str:
     text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16})\b", "[REDACTED]", text)
     text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED PRIVATE KEY]", text, flags=re.S)
     return text
+
+
+def _redact_behavior_text(value: Any) -> str:
+    return _safe_text(value)[:2000]

@@ -13,6 +13,8 @@ from security_runner.models import ScannerContext, ScannerResult
 from security_runner.normalization import normalize, normalize_grype, normalize_gitleaks
 from security_runner.components import ComponentError, normalize_components
 from security_runner.posture import git_remote, normalize_scorecard, validate_scorecard
+from security_runner.api_contract import ApiContractError, load_contract
+from security_runner.api_execution import ApiExecutionError, execute_contract
 
 
 class ScanTimeout(Exception):
@@ -190,6 +192,133 @@ class Scanner(ABC):
             return output[0][:160] if output else "unknown"
         except (OSError, subprocess.SubprocessError):
             return "unavailable"
+
+
+class ApiContractScanner(Scanner):
+    name = "api-contract"
+    output_name = "api-contract-source"
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return True
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return []
+
+    def _version(self) -> str:
+        return "builtin"
+
+    def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
+        self.extra_artifacts = {}
+        started = datetime.now(timezone.utc)
+        clock = time.monotonic()
+        requested = os.environ.get("SECURITY_SCAN_API_CONTRACT") or None
+        raw_relative = "raw/api-contract-source.json"
+        try:
+            contract, source, state = load_contract(context.workspace, requested)
+            if state == "not_found":
+                return ScannerResult(
+                    self.name, "builtin", "not_applicable", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                    int((time.monotonic() - clock) * 1000), raw_relative, reason="No local OpenAPI contract was found.",
+                    reason_code="api_contract_not_found", coverage={"assessment": "not_applicable", "contractCoverage": "not_applicable", "runtimeOperationCoverage": "not_applicable"}
+                ), []
+            assert contract is not None and source is not None
+            extension = source.suffix.lower() if source.suffix.lower() in {".json", ".yaml", ".yml"} else ".json"
+            raw_relative = f"raw/api-contract-source{extension}"
+            raw_path = context.raw_dir / f"api-contract-source{extension}"
+            raw_path.write_bytes(source.read_bytes())
+            self.extra_artifacts = {"apiContract": contract}
+            operations = contract["operations"]
+            coverage = contract["coverage"] | {"operationCount": len(operations), "securitySchemeCount": len(contract["securitySchemes"])}
+            result = ScannerResult(
+                self.name, "builtin", "completed", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                int((time.monotonic() - clock) * 1000), raw_relative, coverage=coverage, finding_count=0, schema_version="1"
+            )
+            return result, []
+        except (ApiContractError, OSError) as exc:
+            return ScannerResult(
+                self.name, "builtin", "failed", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                int((time.monotonic() - clock) * 1000), raw_relative, error=_safe_text(str(exc)),
+                reason_code="api_contract_invalid", coverage={"assessment": "unknown", "contractCoverage": "unknown", "runtimeOperationCoverage": "not_applicable"}
+            ), []
+
+    def _version(self) -> str:
+        try:
+            completed = subprocess.run(self.version_command, capture_output=True, text=True, timeout=10, check=False)
+            output = (completed.stdout or completed.stderr).strip().splitlines()
+            return output[0][:160] if output else "unknown"
+        except (OSError, subprocess.SubprocessError):
+            return "unavailable"
+
+
+class ApiExecutionScanner(Scanner):
+    name = "api-execution"
+    output_name = "schemathesis"
+
+    def __init__(self):
+        super().__init__(True)
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return os.environ.get("SECURITY_SCAN_ENABLE_API_TESTING", "").lower() == "true"
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return []
+
+    def _version(self) -> str:
+        try:
+            import schemathesis
+            return str(getattr(schemathesis, "__version__", "unknown"))
+        except ImportError:
+            return "unavailable"
+
+    def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
+        self.extra_artifacts = {}
+        started = datetime.now(timezone.utc)
+        clock = time.monotonic()
+        raw_relative = "raw/schemathesis.json"
+        output_path = context.output / "api-execution.json"
+        raw_path = context.raw_dir / "schemathesis.json"
+        contract = None
+        try:
+            if not self.can_run(context):
+                return ScannerResult(
+                    self.name, self._version(), "not_applicable", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                    int((time.monotonic() - clock) * 1000), raw_relative, reason="Active API testing was not enabled.",
+                    reason_code="api_testing_not_enabled", coverage={"assessment": "not_applicable", "runtimeOperationCoverage": "not_applicable"}
+                ), []
+            requested = os.environ.get("SECURITY_SCAN_API_CONTRACT") or None
+            contract, source, state = load_contract(context.workspace, requested)
+            if state != "available" or contract is None or source is None:
+                raise ApiExecutionError("Active API testing requires an available local OpenAPI contract.")
+            artifact, _ = execute_contract(
+                source, contract, output_path, raw_path,
+                os.environ.get("SECURITY_SCAN_API_TARGET", ""),
+                int(os.environ.get("SECURITY_SCAN_API_MAX_EXAMPLES", "2")),
+                int(os.environ.get("SECURITY_SCAN_API_MAX_REQUESTS", "20")),
+                float(os.environ.get("SECURITY_SCAN_API_REQUEST_TIMEOUT", "10")),
+                float(os.environ.get("SECURITY_SCAN_API_GLOBAL_TIMEOUT", "60")),
+                os.environ.get("SECURITY_SCAN_API_TEST_MODE", "read-only"),
+                os.environ.get("SECURITY_SCAN_API_BEARER_ENV") or None,
+                os.environ.get("SECURITY_SCAN_API_KEY_HEADER") or None,
+                os.environ.get("SECURITY_SCAN_API_KEY_ENV") or None,
+            )
+            self.extra_artifacts = {"apiExecution": artifact}
+            return ScannerResult(
+                self.name, self._version(), "completed", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                int((time.monotonic() - clock) * 1000), raw_relative, coverage=artifact["coverage"], schema_version="1"
+            ), []
+        except (ApiExecutionError, ValueError, OSError, ImportError) as exc:
+            contract_data = contract or {"contract": {"contentDigest": None}, "apiIdentityVersion": 1, "operations": []}
+            operations = [{"operation": item.get("id"), "state": "unknown", "generatedCases": 0, "completedCases": 0, "candidateFailures": []} for item in contract_data.get("operations", [])]
+            artifact = {"schemaVersion": 1, "contract": {"digest": contract_data["contract"].get("contentDigest"), "apiIdentityVersion": contract_data.get("apiIdentityVersion", 1)}, "activeTesting": True, "status": "failed", "coverage": {"assessment": "unknown", "runtimeOperationCoverage": "unknown"}, "operations": operations, "summary": {"known": len(operations), "attempted": 0, "exercised": 0, "authLimited": 0, "failed": 0, "notAttempted": len(operations), "requests": 0}, "error": _safe_text(str(exc))}
+            output_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            raw_path.write_text(json.dumps({"schemaVersion": 1, "engine": "schemathesis", "error": _safe_text(str(exc))}, indent=2) + "\n", encoding="utf-8")
+            if contract is not None:
+                self.extra_artifacts = {"apiExecution": artifact}
+            return ScannerResult(
+                self.name, self._version(), "failed", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                int((time.monotonic() - clock) * 1000), raw_relative, error=_safe_text(str(exc)),
+                reason_code="api_testing_failed", coverage=artifact["coverage"], schema_version="1"
+            ), []
 
 
 class TrivyScanner(Scanner):

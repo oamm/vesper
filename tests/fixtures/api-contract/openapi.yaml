@@ -1,0 +1,73 @@
+openapi: 3.0.3
+info:
+  title: Loan API
+  version: 1.0.0
+servers:
+  - url: https://production.example.invalid
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+  /loans/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getLoan
+      parameters:
+        - name: includeHistory
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Loan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Loan'
+        '404':
+          description: Missing
+  /loans:
+    post:
+      operationId: createLoan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Loan'
+      responses:
+        '201':
+          description: Created
+        default:
+          description: Error
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Loan:
+      type: object
+      properties:
+        id:
+          type: string

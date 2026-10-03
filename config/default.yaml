@@ -35,3 +35,5 @@ scanner:
     enabled: true
   scorecard:
     enabled: true
+  api_contract:
+    enabled: true

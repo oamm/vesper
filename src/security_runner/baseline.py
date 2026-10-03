@@ -70,6 +70,7 @@ def create_baseline(scan_directory: Path, output_path: Path) -> dict[str, Any]:
         baseline_findings = [
             _baseline_finding(finding, remediation_by_finding.get(finding["id"]))
             for finding in artifacts["findings"]
+            if finding.get("category") != "api_behavior"
         ]
     except (AttributeError, KeyError, TypeError) as exc:
         raise BaselineError("Finding report is malformed and cannot provide stable baseline identity.") from exc
@@ -419,6 +420,10 @@ def _load_scan_artifacts(scan_directory: Path) -> dict[str, Any]:
     finding_ids = set()
     severity_counts = {severity: 0 for severity in SEVERITY_WEIGHT}
     categories = set(CAPABILITY_BY_CATEGORY)
+    if "api_behavior" in summary_findings.get("categories", {}) or any(
+        isinstance(finding, dict) and finding.get("category") == "api_behavior" for finding in findings
+    ):
+        categories.add("api_behavior")
     category_counts = {category: 0 for category in categories}
     for finding in findings:
         if not isinstance(finding, dict) or finding.get("schemaVersion") != 2:

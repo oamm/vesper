@@ -16,12 +16,12 @@ from security_runner.baseline import (
 )
 from security_runner.detection import detect_project
 from security_runner.models import ScannerContext
-from security_runner.normalization import SEVERITY_WEIGHT, deduplicate
+from security_runner.normalization import SEVERITY_WEIGHT, deduplicate, normalize_api_behavior
 from security_runner.policy import evaluate
 from security_runner.remediations import PRIORITY_BY_SEVERITY, PRIORITY_ORDER, build_remediations
 from security_runner.components import ComponentError, component_summary, validate_component_inventory
 from security_runner.posture import PostureError, posture_summary, validate_posture
-from security_runner.scanners import GitleaksScanner, GrypeScanner, OsvScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
+from security_runner.scanners import ApiContractScanner, ApiExecutionScanner, GitleaksScanner, GrypeScanner, OsvScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
 from security_runner import __version__
 
 EXIT_GATE_FAILED = 1
@@ -30,6 +30,8 @@ EXIT_CONFIG_ERROR = 3
 EXIT_INTERNAL_ERROR = 4
 
 SCANNER_CAPABILITIES = {
+    "api-contract": (),
+    "api-execution": (),
     "trivy": ("dependency", "secret", "container", "iac"),
     "osv-scanner": ("dependency",),
     "semgrep": ("sast",),
@@ -102,23 +104,32 @@ def run_scan(
 
     scanner_config = config.get("scanner", {})
     timeout_config = config.get("timeouts", {})
-    scanners = scanner_instances or [
-        TrivyScanner(scanner_config.get("trivy", {}).get("enabled", True)),
-        OsvScanner(scanner_config.get("osv", {}).get("enabled", True)),
-        SastScanner(scanner_config.get("sast", {}).get("enabled", True)),
-    ]
-    if "syft" in scanner_config:
-        scanners.append(SyftScanner(scanner_config.get("syft", {}).get("enabled", False)))
-    if "grype" in scanner_config:
-        scanners.append(GrypeScanner(scanner_config.get("grype", {}).get("enabled", False)))
-    if "gitleaks" in scanner_config:
-        scanners.append(GitleaksScanner(scanner_config.get("gitleaks", {}).get("enabled", False)))
-    if "scorecard" in scanner_config:
-        scanners.append(ScorecardScanner(scanner_config.get("scorecard", {}).get("enabled", False)))
+    if scanner_instances is None:
+        scanners = [
+            TrivyScanner(scanner_config.get("trivy", {}).get("enabled", True)),
+            OsvScanner(scanner_config.get("osv", {}).get("enabled", True)),
+            SastScanner(scanner_config.get("sast", {}).get("enabled", True)),
+        ]
+        if "syft" in scanner_config:
+            scanners.append(SyftScanner(scanner_config.get("syft", {}).get("enabled", False)))
+        if "grype" in scanner_config:
+            scanners.append(GrypeScanner(scanner_config.get("grype", {}).get("enabled", False)))
+        if "gitleaks" in scanner_config:
+            scanners.append(GitleaksScanner(scanner_config.get("gitleaks", {}).get("enabled", False)))
+        if "scorecard" in scanner_config:
+            scanners.append(ScorecardScanner(scanner_config.get("scorecard", {}).get("enabled", False)))
+        if "api_contract" in scanner_config:
+            scanners.append(ApiContractScanner(scanner_config.get("api_contract", {}).get("enabled", False)))
+    else:
+        scanners = scanner_instances
+    if scanner_instances is None and os.environ.get("SECURITY_SCAN_ENABLE_API_TESTING", "").lower() == "true":
+        scanners.append(ApiExecutionScanner())
     all_findings: list[dict[str, Any]] = []
     scanner_results = []
     component_inventory = None
     posture = None
+    api_contract = None
+    api_execution = None
     syft_result = None
     for scanner in scanners:
         if scanner.name == "grype" and hasattr(scanner, "set_input_coverage"):
@@ -138,6 +149,21 @@ def run_scan(
             if posture is not None:
                 raise ReportConsistencyError("Multiple scanners produced posture artifacts.")
             posture = scanner.extra_artifacts["posture"]
+        if "apiContract" in getattr(scanner, "extra_artifacts", {}):
+            if api_contract is not None:
+                raise ReportConsistencyError("Multiple scanners produced API contract artifacts.")
+            api_contract = scanner.extra_artifacts["apiContract"]
+        if "apiExecution" in getattr(scanner, "extra_artifacts", {}):
+            if api_execution is not None:
+                raise ReportConsistencyError("Multiple scanners produced API execution artifacts.")
+            api_execution = scanner.extra_artifacts["apiExecution"]
+
+    if api_execution is not None and api_contract is not None:
+        behavior_findings = normalize_api_behavior(api_execution, api_contract)
+        all_findings.extend(behavior_findings)
+        for result in scanner_results:
+            if result.get("name") == "api-execution":
+                result["findingCount"] = len(behavior_findings)
 
     print("[runner] Normalizing results...", flush=True)
     findings = deduplicate(all_findings)
@@ -180,12 +206,20 @@ def run_scan(
             "startedAt": started_at_text,
             "scanners": scanner_results,
         }
-        comparison = compare_findings(baseline, findings, remediations, comparison_scan, project.report())
+        comparison_findings = [finding for finding in findings if finding.get("category") != "api_behavior"]
+        comparison_remediations = [
+            remediation for remediation in remediations
+            if all(
+                finding_id in {finding.get("id") for finding in comparison_findings}
+                for finding_id in remediation.get("affectedFindings", [])
+            )
+        ]
+        comparison = compare_findings(baseline, comparison_findings, comparison_remediations, comparison_scan, project.report())
         if execution_status == "completed":
             gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
         else:
             gate = {**gate, "baselineDelta": _baseline_delta(comparison, remediations, config)}
-    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config, posture)
+    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config, posture, api_contract, api_execution)
     if comparison is not None:
         summary["baselineComparison"] = {
             "baselineId": comparison["baseline"]["baselineId"],
@@ -196,6 +230,10 @@ def run_scan(
         report_schemas["components"] = 1
     if posture is not None:
         report_schemas["posture"] = 1
+    if api_contract is not None:
+        report_schemas["apiContract"] = 1
+    if api_execution is not None:
+        report_schemas["apiExecution"] = 1
     if comparison is not None:
         report_schemas["comparison"] = comparison["schemaVersion"]
     scan_report = {
@@ -220,8 +258,8 @@ def run_scan(
     project_report["projectName"] = os.environ.get("SECURITY_SCAN_PROJECT_NAME") or workspace.name or ""
     project_report["projectNameSource"] = "launcher-workspace-directory" if os.environ.get("SECURITY_SCAN_PROJECT_NAME") else "workspace-directory"
     if comparison is not None:
-        validate_comparison(comparison, baseline, findings, scan_report)
-    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory, posture)
+        validate_comparison(comparison, baseline, [finding for finding in findings if finding.get("category") != "api_behavior"], scan_report)
+    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory, posture, api_contract, api_execution)
     (output / "project.json").write_text(json.dumps(project_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "remediations.json").write_text(json.dumps(remediations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -231,6 +269,10 @@ def run_scan(
         (output / "components.json").write_text(json.dumps(component_inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if posture is not None:
         (output / "posture.json").write_text(json.dumps(posture, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if api_contract is not None:
+        (output / "api-contract.json").write_text(json.dumps(api_contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if api_execution is not None:
+        (output / "api-execution.json").write_text(json.dumps(api_execution, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if comparison is not None:
         (output / "comparison.json").write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_summary(project.technologies, summary, remediations, scanner_results)
@@ -249,11 +291,15 @@ def _summary(
     component_inventory: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
     posture: dict[str, Any] | None = None,
+    api_contract: dict[str, Any] | None = None,
+    api_execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
     for finding in findings:
         severities[finding["severity"]] += 1
+        if finding["category"] not in categories:
+            categories[finding["category"]] = 0
         categories[finding["category"]] += 1
     priorities = {priority: 0 for priority in PRIORITY_ORDER}
     for remediation in remediations:
@@ -300,6 +346,24 @@ def _summary(
         }
     if posture is not None:
         summary["posture"] = posture_summary(posture)
+    if api_contract is not None:
+        operations = api_contract.get("operations", [])
+        summary["api"] = {
+            "contracts": 1,
+            "operations": len(operations),
+            "authenticatedOperations": sum(item.get("authentication") == "authenticated" for item in operations),
+            "publicOperations": sum(item.get("authentication") == "public" for item in operations),
+            "unknownSecurityOperations": sum(item.get("authentication") == "unknown" for item in operations),
+        }
+    if api_execution is not None:
+        summary["apiExecution"] = api_execution.get("summary", {})
+        api_behavior = [finding for finding in findings if finding.get("category") == "api_behavior"]
+        summary["apiBehavior"] = {
+            "findings": len(api_behavior),
+            "unexpected5xx": sum(finding.get("type") == "unexpected_5xx" for finding in api_behavior),
+            "schemaViolations": sum(finding.get("type") == "response_schema_violation" for finding in api_behavior),
+            "unexpectedStatus": sum(finding.get("type") == "unexpected_status" for finding in api_behavior),
+        }
     return summary
 
 
@@ -521,6 +585,8 @@ def _validate_report_consistency(
     comparison: dict[str, Any] | None = None,
     component_inventory: dict[str, Any] | None = None,
     posture: dict[str, Any] | None = None,
+    api_contract: dict[str, Any] | None = None,
+    api_execution: dict[str, Any] | None = None,
 ) -> None:
     def require(condition: bool, message: str) -> None:
         if not condition:
@@ -541,6 +607,10 @@ def _validate_report_consistency(
         expected_schemas["comparison"] = 1
     if posture is not None:
         expected_schemas["posture"] = 1
+    if api_contract is not None:
+        expected_schemas["apiContract"] = 1
+    if api_execution is not None:
+        expected_schemas["apiExecution"] = 1
     require(scan.get("reportSchemas") == expected_schemas, "Scan report schema manifest is inconsistent.")
     if comparison is None:
         require("baselineComparison" not in summary and "baselineId" not in scan, "Baseline metadata exists without a comparison report.")
@@ -568,6 +638,53 @@ def _validate_report_consistency(
             require(summary.get("components") == component_summary(component_inventory), "Component summary is inconsistent.")
         except ComponentError as exc:
             raise ReportConsistencyError(str(exc)) from exc
+    if api_contract is None:
+        require("api" not in summary, "API summary exists without an API contract.")
+    else:
+        require(api_contract.get("schemaVersion") == 1, "Unsupported API contract schema version.")
+        operations = api_contract.get("operations")
+        require(isinstance(operations, list), "API contract operations are malformed.")
+        ids = [item.get("id") for item in operations if isinstance(item, dict)]
+        require(len(ids) == len(set(ids)) and None not in ids, "API operation IDs must be unique.")
+        expected_api = {
+            "contracts": 1,
+            "operations": len(operations),
+            "authenticatedOperations": sum(item.get("authentication") == "authenticated" for item in operations),
+            "publicOperations": sum(item.get("authentication") == "public" for item in operations),
+            "unknownSecurityOperations": sum(item.get("authentication") == "unknown" for item in operations),
+        }
+        require(summary.get("api") == expected_api, "API summary is inconsistent.")
+    if api_execution is None:
+        require("apiExecution" not in summary, "API execution summary exists without an API execution artifact.")
+    else:
+        require(api_execution.get("schemaVersion") == 1, "Unsupported API execution schema version.")
+        require(api_contract is not None, "API execution requires an API contract artifact.")
+        require(api_execution.get("contract", {}).get("digest") == api_contract.get("contract", {}).get("contentDigest"), "API execution contract digest is inconsistent.")
+        operation_ids = {item.get("id") for item in (api_contract or {}).get("operations", [])}
+        execution_operations = api_execution.get("operations")
+        require(isinstance(execution_operations, list), "API execution operations are malformed.")
+        require(all(item.get("operation") in operation_ids for item in execution_operations if isinstance(item, dict)), "API execution references an unknown operation.")
+        aggregate = api_execution.get("summary")
+        require(isinstance(aggregate, dict) and summary.get("apiExecution") == aggregate, "API execution summary is inconsistent.")
+        require(aggregate.get("known") == len(execution_operations), "API execution known-operation count is inconsistent.")
+    behavior_findings = [finding for finding in findings if finding.get("category") == "api_behavior"]
+    if api_execution is None:
+        require(not behavior_findings and "apiBehavior" not in summary, "Behavioral API findings exist without API execution evidence.")
+    else:
+        require(summary.get("apiBehavior", {}).get("findings") == len(behavior_findings), "API behavioral finding summary is inconsistent.")
+        operation_ids = {item.get("id") for item in (api_contract or {}).get("operations", [])}
+        execution_events = {
+            (event.get("operation"), event.get("classification"))
+            for event in api_execution.get("events", [])
+            if isinstance(event, dict)
+        }
+        for finding in behavior_findings:
+            evidence = finding.get("behaviorEvidence") or {}
+            operation = evidence.get("operation")
+            behavior = evidence.get("behaviorType")
+            require(operation in operation_ids, "Behavioral finding references an unknown API operation.")
+            require((operation, behavior) in execution_events, "Behavioral finding references missing API execution evidence.")
+            require(behavior in {"unexpected_5xx", "response_schema_violation", "unexpected_status"}, "Unsupported API behavioral finding type.")
     if posture is None:
         require("posture" not in summary, "Posture summary exists without a posture inventory.")
     else:
@@ -598,6 +715,8 @@ def _validate_report_consistency(
     category_counts = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
     for finding in findings:
         require(finding.get("severity") in severity_counts, "Finding has an unsupported severity.")
+        if finding.get("category") == "api_behavior":
+            category_counts.setdefault("api_behavior", 0)
         require(finding.get("category") in category_counts, "Finding has an unsupported category.")
         severity_counts[finding["severity"]] += 1
         category_counts[finding["category"]] += 1
