@@ -16,6 +16,7 @@ CAPABILITY_BY_CATEGORY = {
     "secret": "secret",
     "container": "container",
     "iac": "iac",
+    "api_behavior": "api_behavior",
 }
 SEVERITY_WEIGHT = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 SCANNERS_BY_CAPABILITY = {
@@ -24,6 +25,7 @@ SCANNERS_BY_CAPABILITY = {
     "secret": {"trivy", "gitleaks"},
     "container": {"trivy"},
     "iac": {"trivy"},
+    "api_behavior": {"api-execution"},
 }
 
 
@@ -70,7 +72,6 @@ def create_baseline(scan_directory: Path, output_path: Path) -> dict[str, Any]:
         baseline_findings = [
             _baseline_finding(finding, remediation_by_finding.get(finding["id"]))
             for finding in artifacts["findings"]
-            if finding.get("category") != "api_behavior"
         ]
     except (AttributeError, KeyError, TypeError) as exc:
         raise BaselineError("Finding report is malformed and cannot provide stable baseline identity.") from exc
@@ -168,7 +169,7 @@ def validate_baseline(baseline: Any) -> dict[str, Any]:
             or identity_data.get("identityVersion") != IDENTITY_VERSION
             or identity_data.get("capability") != finding["capability"]
             or identity_data.get("category") != finding["category"]
-            or identity_data.get("target") != finding["target"]
+            or (category != "api_behavior" and identity_data.get("target") != finding["target"])
             or hashlib.sha256(_canonical_json(identity_data).encode("utf-8")).hexdigest() != identity
         ):
             raise BaselineError("Baseline finding identity does not match its semantic identity data.")
@@ -196,6 +197,23 @@ def validate_baseline(baseline: Any) -> dict[str, Any]:
             })
             if identity_candidates != expected_candidates or identity_data.get("vulnerability") != _canonical_vulnerability(identifiers):
                 raise BaselineError("Baseline dependency identity candidates do not match its identifiers.")
+        elif category == "api_behavior":
+            evidence = finding.get("behaviorEvidence")
+            if (
+                not isinstance(evidence, dict)
+                or not isinstance(evidence.get("operation"), str)
+                or not evidence["operation"]
+                or evidence.get("behaviorType") not in {"unexpected_5xx", "response_schema_violation", "unexpected_status"}
+                or not isinstance(evidence.get("expectedStatuses"), list)
+            ):
+                raise BaselineError("API behavioral identity evidence is missing or malformed.")
+            if (
+                identity_data.get("target") != finding["target"]
+                or identity_data.get("operation") != evidence["operation"]
+                or identity_data.get("behaviorType") != evidence["behaviorType"]
+                or identity_data.get("expectedStatuses") != sorted(str(value) for value in evidence["expectedStatuses"])
+            ):
+                raise BaselineError("API behavioral identity does not match its evidence.")
         elif identity_candidates != [identity]:
             raise BaselineError("Non-dependency finding must have exactly one semantic identity candidate.")
         if identity in identities:
@@ -215,6 +233,7 @@ def compare_findings(
     remediations: list[dict[str, Any]],
     scan: dict[str, Any],
     project: dict[str, Any],
+    api_execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     baseline = validate_baseline(baseline)
     remediation_by_finding = _remediations_by_finding(remediations)
@@ -282,7 +301,7 @@ def compare_findings(
     for old in baseline["findings"]:
         if old["identity"] in matched_old_ids:
             continue
-        reason_code, evidence = _resolution_evidence(old, current_scanners, project)
+        reason_code, evidence = _resolution_evidence(old, current_scanners, project, api_execution)
         state = "resolved" if reason_code is None else "unverified"
         record = {
             "state": state,
@@ -332,6 +351,7 @@ def validate_comparison(
 
     current_ids = {finding.get("id") for finding in findings}
     baseline_fingerprints = {finding["fingerprint"] for finding in baseline["findings"]}
+    baseline_by_fingerprint = {finding["fingerprint"]: finding for finding in baseline["findings"]}
     referenced_current: set[str] = set()
     referenced_baseline: set[str] = set()
     for state in STATES:
@@ -362,6 +382,30 @@ def validate_comparison(
                 referenced_baseline.add(baseline_fingerprint)
                 if state == "unverified" and not isinstance(record.get("reasonCode"), str):
                     raise BaselineError("Unverified comparison entry has no reason code.")
+                if state == "resolved" and baseline_by_fingerprint[baseline_fingerprint].get("category") == "api_behavior":
+                    evidence = record.get("resolutionEvidence")
+                    execution = scan.get("apiExecution") or {}
+                    operation = (baseline_by_fingerprint[baseline_fingerprint].get("behaviorEvidence") or {}).get("operation")
+                    operation_record = next(
+                        (item for item in execution.get("operations", []) if isinstance(item, dict) and item.get("operation") == operation),
+                        None,
+                    )
+                    required = {
+                        "unexpected_5xx": "statusValidation",
+                        "response_schema_violation": "responseSchemaValidation",
+                        "unexpected_status": "statusValidation",
+                    }.get((baseline_by_fingerprint[baseline_fingerprint].get("behaviorEvidence") or {}).get("behaviorType"))
+                    if (
+                        not isinstance(evidence, dict)
+                        or evidence.get("scanner") != "api-execution"
+                        or execution.get("activeTesting") is not True
+                        or execution.get("status") == "failed"
+                        or not isinstance(operation_record, dict)
+                        or operation_record.get("state") != "exercised"
+                        or not required
+                        or (operation_record.get("validation") or {}).get(required) is not True
+                    ):
+                        raise BaselineError("API behavioral resolution lacks positive runtime coverage evidence.")
     if referenced_current != current_ids:
         raise BaselineError("Comparison does not classify every current finding exactly once.")
     if referenced_baseline != baseline_fingerprints:
@@ -419,7 +463,7 @@ def _load_scan_artifacts(scan_directory: Path) -> dict[str, Any]:
         raise BaselineError("Scan scanner metadata is malformed.")
     finding_ids = set()
     severity_counts = {severity: 0 for severity in SEVERITY_WEIGHT}
-    categories = set(CAPABILITY_BY_CATEGORY)
+    categories = set(CAPABILITY_BY_CATEGORY) - {"api_behavior"}
     if "api_behavior" in summary_findings.get("categories", {}) or any(
         isinstance(finding, dict) and finding.get("category") == "api_behavior" for finding in findings
     ):
@@ -456,7 +500,9 @@ def _baseline_finding(finding: dict[str, Any], remediation: dict[str, Any] | Non
     if capability is None:
         raise BaselineError(f"Unsupported finding category in baseline: {category!r}.")
     location = finding.get("location") or {}
-    target = normalize_target(location.get("file"))
+    behavior_evidence = finding.get("behaviorEvidence") or {}
+    raw_target = behavior_evidence.get("operation") if category == "api_behavior" else location.get("file")
+    target = normalize_target(raw_target)
     package = finding.get("package") or {}
     security = finding.get("security") or {}
     identifiers = [str(value) for value in security.get("identifiers", []) if value]
@@ -504,6 +550,33 @@ def _baseline_finding(finding: dict[str, Any], remediation: dict[str, Any] | Non
         "installedVersion": package.get("version"),
         "recommendedVersion": ((remediation or {}).get("package") or {}).get("recommendedVersion"),
     }
+    if category == "api_behavior":
+        evidence = behavior_evidence
+        operation = str(evidence.get("operation") or location.get("operation") or "")
+        behavior = str(evidence.get("behaviorType") or finding.get("type") or "")
+        expected = sorted(str(value) for value in evidence.get("expectedStatuses", []) if value is not None)
+        observed = sorted(str(value) for value in evidence.get("observedStatuses", []) if value is not None)
+        target = operation
+        identity_data = {
+            "identityVersion": IDENTITY_VERSION,
+            "capability": capability,
+            "category": category,
+            "target": operation,
+            "operation": operation,
+            "behaviorType": behavior,
+            "expectedStatuses": expected,
+        }
+        identity_candidates = [hashlib.sha256(_canonical_json(identity_data).encode("utf-8")).hexdigest()]
+        identity = identity_candidates[0]
+        semantic_state = {
+            "severity": finding.get("severity", "unknown"),
+            "expectedStatuses": expected,
+            "observedStatuses": observed,
+        }
+    elif category == "dependency":
+        identity = hashlib.sha256(_canonical_json(identity_data).encode("utf-8")).hexdigest()
+    else:
+        identity = hashlib.sha256(_canonical_json(identity_data).encode("utf-8")).hexdigest()
     minimal_package = None
     if package:
         minimal_package = {
@@ -528,16 +601,59 @@ def _baseline_finding(finding: dict[str, Any], remediation: dict[str, Any] | Non
         "package": minimal_package,
         "semanticState": semantic_state,
         "detectors": detectors,
+        **({"behaviorEvidence": {
+            "operation": identity_data["operation"],
+            "behaviorType": identity_data["behaviorType"],
+            "expectedStatuses": identity_data["expectedStatuses"],
+        }} if category == "api_behavior" else {}),
         **({"historical": True} if (finding.get("secretEvidence") or {}).get("scope") == "historical" else {}),
     }
 
 
-def _resolution_evidence(finding: dict[str, Any], scanners: list[dict[str, Any]], project: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+def _resolution_evidence(
+    finding: dict[str, Any],
+    scanners: list[dict[str, Any]],
+    project: dict[str, Any],
+    api_execution: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
     capability = finding["capability"]
     target = finding["target"]
     relevant = [scanner for scanner in scanners if scanner.get("name") in SCANNERS_BY_CAPABILITY[capability]]
     if not relevant:
         return "capability_not_executed", None
+    if capability == "api_behavior":
+        if not isinstance(api_execution, dict) or api_execution.get("activeTesting") is not True:
+            return "passive_scan", None
+        if api_execution.get("status") == "failed":
+            return "runtime_failed", None
+        operation = (finding.get("behaviorEvidence") or {}).get("operation") or target
+        record = next((item for item in api_execution.get("operations", []) if isinstance(item, dict) and item.get("operation") == operation), None)
+        if record is None:
+            return "missing_operation", None
+        state = record.get("state")
+        if state == "auth_limited":
+            return "auth_limited", None
+        if state in {"not_attempted", "unknown"}:
+            return "operation_not_attempted", None
+        if state in {"failed", "partial"}:
+            return "runtime_failed", None
+        if state != "exercised":
+            return "operation_not_attempted", None
+        behavior = (finding.get("behaviorEvidence") or {}).get("behaviorType")
+        validation = record.get("validation") or {}
+        required = {
+            "unexpected_5xx": "statusValidation",
+            "response_schema_violation": "responseSchemaValidation",
+            "unexpected_status": "statusValidation",
+        }.get(behavior)
+        if not required or validation.get(required) is not True:
+            return "validation_unavailable", None
+        return None, {
+            "scanner": "api-execution",
+            "operation": operation,
+            "state": state,
+            "validation": {required: True},
+        }
     if capability == "dependency":
         osv = next((scanner for scanner in relevant if scanner.get("name") == "osv-scanner"), None)
         if osv:
@@ -653,7 +769,7 @@ def _remediations_by_finding(remediations: list[dict[str, Any]]) -> dict[str, di
 def _baseline_display(finding: dict[str, Any]) -> dict[str, Any]:
     return {
         key: finding[key]
-        for key in ("fingerprint", "title", "severity", "category", "capability", "target", "identifiers", "package", "semanticState", "historical")
+        for key in ("fingerprint", "title", "severity", "category", "capability", "target", "identifiers", "package", "semanticState", "behaviorEvidence", "historical")
         if key in finding
     }
 

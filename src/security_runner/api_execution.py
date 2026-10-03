@@ -143,7 +143,14 @@ def execute_contract(
     start = time.monotonic()
     requests_sent = 0
     operation_records: dict[str, dict[str, Any]] = {
-        identifier: {"operation": identifier, "state": "not_attempted", "generatedCases": 0, "completedCases": 0, "candidateFailures": []}
+        identifier: {
+            "operation": identifier,
+            "state": "not_attempted",
+            "generatedCases": 0,
+            "completedCases": 0,
+            "candidateFailures": [],
+            "validation": {"statusValidation": False, "responseSchemaValidation": False},
+        }
         for identifier in sorted(contract_ids)
     }
     events: list[dict[str, Any]] = []
@@ -176,6 +183,8 @@ def execute_contract(
                 body_bytes = response.content
                 response_truncated = len(body_bytes) > MAX_BODY
                 event = {**metadata, "status": status, "durationMs": 0, "responseTruncated": response_truncated}
+                record["validation"]["statusValidation"] = True
+                record["validation"]["responseSchemaValidation"] = not response_truncated
                 if status in {401, 403} and contract_auth.get(identifier) == "authenticated" and not (token or api_key):
                     event["classification"] = "auth_limited"
                 elif status >= 500:
@@ -219,6 +228,7 @@ def execute_contract(
         "contract": {"digest": contract["contract"]["contentDigest"], "apiIdentityVersion": contract["apiIdentityVersion"]},
         "target": {key: target_info[key] for key in ("scheme", "host", "port", "basePath")},
         "activeTesting": True,
+        "status": "completed",
         "mode": test_mode,
         "limits": {"maxExamplesPerOperation": max_examples, "maxRequests": max_requests, "requestTimeoutSeconds": request_timeout, "globalTimeoutSeconds": global_timeout, "concurrency": 1},
         "operations": [operation_records[key] for key in sorted(operation_records)],

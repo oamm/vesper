@@ -302,14 +302,15 @@ class ApiExecutionScanner(Scanner):
                 os.environ.get("SECURITY_SCAN_API_KEY_ENV") or None,
             )
             self.extra_artifacts = {"apiExecution": artifact}
+            coverage = {**artifact["coverage"], "operations": artifact.get("operations", [])}
             return ScannerResult(
                 self.name, self._version(), "completed", started.isoformat(), datetime.now(timezone.utc).isoformat(),
-                int((time.monotonic() - clock) * 1000), raw_relative, coverage=artifact["coverage"], schema_version="1"
+                int((time.monotonic() - clock) * 1000), raw_relative, coverage=coverage, schema_version="1"
             ), []
         except (ApiExecutionError, ValueError, OSError, ImportError) as exc:
             contract_data = contract or {"contract": {"contentDigest": None}, "apiIdentityVersion": 1, "operations": []}
             operations = [{"operation": item.get("id"), "state": "unknown", "generatedCases": 0, "completedCases": 0, "candidateFailures": []} for item in contract_data.get("operations", [])]
-            artifact = {"schemaVersion": 1, "contract": {"digest": contract_data["contract"].get("contentDigest"), "apiIdentityVersion": contract_data.get("apiIdentityVersion", 1)}, "activeTesting": True, "status": "failed", "coverage": {"assessment": "unknown", "runtimeOperationCoverage": "unknown"}, "operations": operations, "summary": {"known": len(operations), "attempted": 0, "exercised": 0, "authLimited": 0, "failed": 0, "notAttempted": len(operations), "requests": 0}, "error": _safe_text(str(exc))}
+            artifact = {"schemaVersion": 1, "contract": {"digest": contract_data["contract"].get("contentDigest"), "apiIdentityVersion": contract_data.get("apiIdentityVersion", 1)}, "activeTesting": True, "status": "failed", "coverage": {"assessment": "unknown", "runtimeOperationCoverage": "unknown", "operations": operations}, "operations": operations, "summary": {"known": len(operations), "attempted": 0, "exercised": 0, "authLimited": 0, "failed": 0, "notAttempted": len(operations), "requests": 0}, "error": _safe_text(str(exc))}
             output_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             raw_path.write_text(json.dumps({"schemaVersion": 1, "engine": "schemathesis", "error": _safe_text(str(exc))}, indent=2) + "\n", encoding="utf-8")
             if contract is not None:

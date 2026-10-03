@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from security_runner.baseline import BaselineError, create_baseline, load_baseline, normalize_target
+from security_runner.baseline import BaselineError, create_baseline, load_baseline, normalize_target, validate_comparison
 from security_runner.baseline_cli import main as baseline_cli_main
 from security_runner.models import ScannerResult
-from security_runner.normalization import normalize, normalize_grype
+from security_runner.normalization import normalize, normalize_api_behavior, normalize_grype
 from security_runner.runner import run_scan
 from security_runner.scanners import OsvScanner, SastScanner
 
@@ -73,6 +73,135 @@ class BaselineTests(unittest.TestCase):
         baseline = create_baseline(output, baseline_path)
         self.assertEqual(load_baseline(baseline_path), baseline)
         return workspace, output, baseline
+
+    def _api_fixture_scanners(self, root, events, state="exercised", validation=None, active=True, status="completed"):
+        contract = {
+            "schemaVersion": 1,
+            "apiIdentityVersion": 1,
+            "contract": {"contentDigest": "a" * 64},
+            "coverage": {"contractCoverage": "complete"},
+            "securitySchemes": [],
+            "operations": [{
+                "id": "POST /loans",
+                "method": "POST",
+                "path": "/loans",
+                "responses": [{"status": "201"}, {"status": "400"}],
+                "authentication": "public",
+            }],
+        }
+        execution = {
+            "schemaVersion": 1,
+            "contract": {"digest": "a" * 64, "apiIdentityVersion": 1},
+            "activeTesting": active,
+            "status": status,
+            "operations": [{
+                "operation": "POST /loans",
+                "state": state,
+                "generatedCases": 1 if state != "not_attempted" else 0,
+                "completedCases": 1 if state == "exercised" else 0,
+                "candidateFailures": [],
+                "validation": validation or {"statusValidation": True, "responseSchemaValidation": True},
+            }],
+            "events": events,
+            "summary": {"known": 1, "attempted": state != "not_attempted", "exercised": state == "exercised", "authLimited": state == "auth_limited", "failed": state == "failed", "notAttempted": state == "not_attempted", "requests": 1 if state == "exercised" else 0},
+            "coverage": {"assessment": "complete" if state == "exercised" else "partial", "runtimeOperationCoverage": "complete" if state == "exercised" else "partial"},
+        }
+
+        class ApiContractFixture:
+            name = "api-contract"
+
+            def execute(self, context):
+                self.extra_artifacts = {"apiContract": contract}
+                now = datetime.now(timezone.utc).isoformat()
+                return ScannerResult(self.name, "builtin", "completed", now, now, 1, "raw/api-contract-source.yaml", coverage={"assessment": "complete", "contractCoverage": "complete"}), []
+
+        class ApiExecutionFixture:
+            name = "api-execution"
+
+            def execute(self, context):
+                self.extra_artifacts = {"apiExecution": execution}
+                (context.raw_dir / "schemathesis.json").write_text(json.dumps({"schemaVersion": 1, "events": events}), encoding="utf-8")
+                now = datetime.now(timezone.utc).isoformat()
+                coverage = {**execution["coverage"], "operations": execution["operations"]}
+                return ScannerResult(self.name, "3.39.16", status, now, now, 1, "raw/schemathesis.json", finding_count=len(events), coverage=coverage, schema_version="1"), []
+
+        class CombinedApiFixture:
+            def __init__(self):
+                self.contract_scanner = ApiContractFixture()
+                self.execution_scanner = ApiExecutionFixture()
+
+            def execute(self, context):
+                self.extra_artifacts = {}
+                return ScannerResult("api-fixture", "test", "clean", datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), 1, "raw/fixture.json"), []
+
+        contract_scanner = ApiContractFixture()
+        execution_scanner = ApiExecutionFixture()
+        return [contract_scanner, execution_scanner], contract, execution
+
+    def _run_api_fixture(self, root, name, events, baseline=None, **kwargs):
+        workspace = root / "workspace"
+        workspace.mkdir(exist_ok=True)
+        output = root / name
+        scanners, contract, execution = self._api_fixture_scanners(root, events, **kwargs)
+        # The runner's scanner boundary consumes scanner instances directly; both
+        # adapters expose their own extra artifacts during execution.
+        code, _ = run_scan(workspace, output, scan_config(), scanners, baseline=baseline)
+        return code, output, contract, execution
+
+    def test_api_behavior_baseline_states_and_positive_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event = {"operation": "POST /loans", "method": "POST", "path": "/loans", "caseId": "case-a", "classification": "unexpected_5xx", "status": 500, "contentType": "application/json"}
+            code, initial, _, _ = self._run_api_fixture(root, "initial", [event])
+            self.assertEqual(code, 0)
+            baseline = create_baseline(initial, root / "api-baseline.json")
+            self.assertEqual(len(baseline["findings"]), 1)
+            self.assertEqual(baseline["findings"][0]["category"], "api_behavior")
+
+            code, unchanged, _, _ = self._run_api_fixture(root, "unchanged", [event], baseline=baseline)
+            self.assertEqual(code, 0)
+            comparison = json.loads((unchanged / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(comparison["summary"], {"new": 0, "existing": 1, "changed": 0, "resolved": 0, "unverified": 0})
+
+            schema_event = {"operation": "POST /loans", "method": "POST", "path": "/loans", "caseId": "case-b", "classification": "response_schema_violation", "status": 201, "contentType": "application/json"}
+            code, added, _, _ = self._run_api_fixture(root, "added", [event, schema_event], baseline=baseline)
+            self.assertEqual(code, 0)
+            added_comparison = json.loads((added / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(added_comparison["summary"]["existing"], 1)
+            self.assertEqual(added_comparison["summary"]["new"], 1)
+
+            code, changed, _, _ = self._run_api_fixture(root, "changed", [{**event, "status": 501}], baseline=baseline)
+            self.assertEqual(code, 0)
+            changed_comparison = json.loads((changed / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(changed_comparison["summary"]["changed"], 1)
+
+            code, resolved, _, _ = self._run_api_fixture(root, "resolved", [], baseline=baseline, validation={"statusValidation": True, "responseSchemaValidation": True})
+            self.assertEqual(code, 0)
+            resolved_comparison = json.loads((resolved / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(resolved_comparison["summary"]["resolved"], 1)
+            self.assertEqual(resolved_comparison["summary"]["unverified"], 0)
+            invalid_resolution = json.loads(json.dumps(resolved_comparison))
+            scan_report = json.loads((resolved / "scan.json").read_text(encoding="utf-8"))
+            scan_report["apiExecution"]["operations"][0]["validation"]["statusValidation"] = False
+            findings_report = json.loads((resolved / "findings.json").read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(BaselineError, "positive runtime coverage"):
+                validate_comparison(invalid_resolution, baseline, findings_report, scan_report)
+
+            code, auth_limited, _, _ = self._run_api_fixture(root, "auth-limited", [], baseline=baseline, state="auth_limited", validation={"statusValidation": False, "responseSchemaValidation": False})
+            auth_comparison = json.loads((auth_limited / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(auth_comparison["findings"]["unverified"][0]["reasonCode"], "auth_limited")
+
+            code, passive, _, _ = self._run_api_fixture(root, "passive", [], baseline=baseline, active=False, status="not_applicable", state="not_attempted")
+            passive_comparison = json.loads((passive / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(passive_comparison["findings"]["unverified"][0]["reasonCode"], "passive_scan")
+
+            code, unavailable, _, _ = self._run_api_fixture(root, "validation-unavailable", [], baseline=baseline, validation={"statusValidation": False, "responseSchemaValidation": False})
+            unavailable_comparison = json.loads((unavailable / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(unavailable_comparison["findings"]["unverified"][0]["reasonCode"], "validation_unavailable")
+
+            code, failed, _, _ = self._run_api_fixture(root, "runtime-failed", [], baseline=baseline, state="failed", status="failed")
+            failed_comparison = json.loads((failed / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(failed_comparison["findings"]["unverified"][0]["reasonCode"], "runtime_failed")
 
     def test_baseline_creation_is_deterministic_and_rejects_incomplete_or_corrupt_reports(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -9,7 +10,10 @@ from unittest.mock import patch
 
 from security_runner.api_contract import load_contract
 from security_runner.api_execution import ApiExecutionError, execute_contract, normalize_target
+from security_runner.baseline import create_baseline
 from security_runner.normalization import normalize_api_behavior
+from security_runner.runner import run_scan
+from security_runner.scanners import ApiContractScanner, ApiExecutionScanner
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
@@ -163,6 +167,53 @@ class ApiExecutionTests(unittest.TestCase):
         result, _, _ = self._run(target="http://127.0.0.1:9")
         self.assertEqual(result["summary"]["failed"], 2)
         self.assertFalse(normalize_api_behavior(result, load_contract(self.fixture.parent, "openapi.yaml")[0]))
+
+    def test_integrated_runner_behavior_baseline_acceptance(self):
+        _FixtureHandler.force_500 = True
+        config = {
+            "policy": {"failOn": [], "failOnSecrets": False, "maxHigh": None},
+            "baseline": {"failOnNew": ["critical", "high"]},
+            "timeouts": {},
+        }
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            shutil.copy2(self.fixture, workspace / "openapi.yaml")
+            environment = {
+                "SECURITY_SCAN_API_CONTRACT": "openapi.yaml",
+                "SECURITY_SCAN_ENABLE_API_TESTING": "true",
+                "SECURITY_SCAN_API_TARGET": f"http://127.0.0.1:{self.server.server_port}",
+                "SECURITY_SCAN_API_MAX_EXAMPLES": "1",
+                "SECURITY_SCAN_API_MAX_REQUESTS": "4",
+                "SECURITY_SCAN_API_TEST_MODE": "read-only",
+                "SECURITY_SCAN_API_BEARER_ENV": "",
+                "SECURITY_SCAN_API_KEY_ENV": "",
+                "SECURITY_SCAN_API_KEY_HEADER": "",
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                first = root / "first"
+                code, _ = run_scan(workspace, first, config, [ApiContractScanner(True), ApiExecutionScanner()])
+                self.assertEqual(code, 0)
+                findings = json.loads((first / "findings.json").read_text(encoding="utf-8"))
+                self.assertGreaterEqual(len(findings), 1)
+                self.assertTrue(all(item["category"] == "api_behavior" for item in findings))
+                baseline = create_baseline(first, root / "baseline.json")
+                self.assertEqual(len(baseline["findings"]), len(findings))
+
+                second = root / "second"
+                code, _ = run_scan(workspace, second, config, [ApiContractScanner(True), ApiExecutionScanner()], baseline=baseline)
+            comparison = json.loads((second / "comparison.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0)
+            self.assertEqual(comparison["summary"]["new"], 0)
+            self.assertEqual(comparison["summary"]["changed"], 0)
+            self.assertEqual(comparison["summary"]["resolved"], 0)
+            self.assertEqual(comparison["summary"]["unverified"], 0)
+            self.assertEqual(comparison["summary"]["existing"], len(findings))
+            self.assertTrue((second / "api-contract.json").exists())
+            self.assertTrue((second / "api-execution.json").exists())
+            self.assertTrue((second / "raw" / "schemathesis.json").exists())
+            self.assertGreaterEqual(len(_FixtureHandler.requests), 2)
 
 
 if __name__ == "__main__":

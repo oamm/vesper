@@ -206,15 +206,14 @@ def run_scan(
             "startedAt": started_at_text,
             "scanners": scanner_results,
         }
-        comparison_findings = [finding for finding in findings if finding.get("category") != "api_behavior"]
-        comparison_remediations = [
-            remediation for remediation in remediations
-            if all(
-                finding_id in {finding.get("id") for finding in comparison_findings}
-                for finding_id in remediation.get("affectedFindings", [])
-            )
-        ]
-        comparison = compare_findings(baseline, comparison_findings, comparison_remediations, comparison_scan, project.report())
+        comparison = compare_findings(
+            baseline,
+            findings,
+            remediations,
+            comparison_scan,
+            project.report(),
+            api_execution,
+        )
         if execution_status == "completed":
             gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
         else:
@@ -249,6 +248,14 @@ def run_scan(
         "generator": {"name": "Vesper", "version": __version__},
         "scanners": scanner_results,
     }
+    if api_execution is not None:
+        scan_report["apiExecution"] = {
+            "schemaVersion": api_execution.get("schemaVersion"),
+            "activeTesting": api_execution.get("activeTesting"),
+            "status": api_execution.get("status", "completed"),
+            "contract": api_execution.get("contract"),
+            "operations": api_execution.get("operations", []),
+        }
     repository_metadata = _repository_metadata()
     if repository_metadata:
         scan_report["repository"] = repository_metadata
@@ -258,7 +265,7 @@ def run_scan(
     project_report["projectName"] = os.environ.get("SECURITY_SCAN_PROJECT_NAME") or workspace.name or ""
     project_report["projectNameSource"] = "launcher-workspace-directory" if os.environ.get("SECURITY_SCAN_PROJECT_NAME") else "workspace-directory"
     if comparison is not None:
-        validate_comparison(comparison, baseline, [finding for finding in findings if finding.get("category") != "api_behavior"], scan_report)
+        validate_comparison(comparison, baseline, findings, scan_report)
     _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory, posture, api_contract, api_execution)
     (output / "project.json").write_text(json.dumps(project_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
