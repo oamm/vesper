@@ -1,5 +1,6 @@
 import hashlib
 import re
+from urllib.parse import urlsplit
 from typing import Any
 
 SEVERITIES = {"critical", "high", "medium", "low", "info", "unknown"}
@@ -30,7 +31,52 @@ def normalize(scanner: str, raw: Any) -> list[dict[str, Any]]:
         return _normalize_grype(raw)
     if scanner == "gitleaks":
         return normalize_gitleaks(raw)
+    if scanner == "zap-passive":
+        return normalize_zap_alerts(raw, {}, {})
     return []
+
+
+def normalize_zap_alerts(raw: Any, surface: dict[str, Any], runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    resources = {item.get("path"): item for item in surface.get("resources", []) if isinstance(item, dict)}
+    findings: list[dict[str, Any]] = []
+    risk_severity = {"0": "info", "1": "low", "2": "medium", "3": "high", "4": "critical", "informational": "info", "info": "info", "low": "low", "medium": "medium", "high": "high", "critical": "critical"}
+    for alert in raw if isinstance(raw, list) else []:
+        if not isinstance(alert, dict):
+            continue
+        url = str(alert.get("url") or "")
+        parsed = urlsplit(url)
+        path = parsed.path or "/"
+        resource = resources.get(path)
+        resource_id = resource.get("identity") if resource else hashlib.sha256(path.encode("utf-8")).hexdigest()
+        plugin = str(alert.get("pluginId") or alert.get("alertRef") or alert.get("alert") or "unknown")
+        native_risk = alert.get("riskcode")
+        if native_risk is None:
+            native_risk = alert.get("risk")
+        severity = risk_severity.get(str(native_risk).strip().casefold(), "unknown")
+        title = str(alert.get("alert") or "ZAP passive alert")[:300]
+        description = str(alert.get("description") or alert.get("otherinfo") or title)[:2000]
+        finding = _finding(
+            "runtime_passive", plugin, title, description, severity, "zap-passive", plugin,
+            "", None, None, [], [], None, None, str(alert.get("reference") or ""), plugin,
+            identity_extra=f"{resource_id}|{plugin}",
+        )
+        finding["capability"] = "runtime_passive"
+        finding["findingNature"] = "runtime_passive"
+        finding["location"] = {"file": "runtime/" + (path.lstrip("/") or "root"), "runtimeResource": resource_id, "path": path, "line": None, "column": None}
+        finding["runtimeEvidence"] = {
+            "resourceId": resource_id,
+            "path": path,
+            "alertId": plugin,
+            "alert": title,
+            "risk": str(alert.get("riskdesc") or alert.get("riskcode") or "unknown")[:100],
+            "confidence": str(alert.get("confidence") or "unknown")[:100],
+            "evidence": _redact_behavior_text(alert.get("evidence") or "")[:500],
+            "solution": _redact_behavior_text(alert.get("solution") or "")[:1000],
+        }
+        finding["evidence"] = {"message": description, "runtimeResource": resource_id, "alertId": plugin}
+        finding["remediation"] = _redact_behavior_text(alert.get("solution") or "Review the passive runtime alert and harden the affected resource.")[:1000]
+        findings.append(finding)
+    return findings
 
 
 def normalize_api_behavior(api_execution: dict[str, Any], api_contract: dict[str, Any]) -> list[dict[str, Any]]:

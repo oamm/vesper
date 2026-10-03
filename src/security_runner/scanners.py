@@ -15,6 +15,7 @@ from security_runner.components import ComponentError, normalize_components
 from security_runner.posture import git_remote, normalize_scorecard, validate_scorecard
 from security_runner.api_contract import ApiContractError, load_contract
 from security_runner.api_execution import ApiExecutionError, execute_contract
+from security_runner.runtime_surface import execute_passive
 
 
 class ScanTimeout(Exception):
@@ -213,6 +214,13 @@ class ApiContractScanner(Scanner):
         clock = time.monotonic()
         requested = os.environ.get("SECURITY_SCAN_API_CONTRACT") or None
         raw_relative = "raw/api-contract-source.json"
+        if not self.enabled:
+            (context.raw_dir / "api-contract-source.json").write_text("{}\n", encoding="utf-8")
+            return ScannerResult(
+                self.name, "builtin", "skipped", started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                int((time.monotonic() - clock) * 1000), raw_relative, reason="disabled by configuration",
+                reason_code="disabled_by_configuration", coverage={"assessment": "not_applicable", "contractCoverage": "not_applicable", "runtimeOperationCoverage": "not_applicable"}
+            ), []
         try:
             contract, source, state = load_contract(context.workspace, requested)
             if state == "not_found":
@@ -320,6 +328,24 @@ class ApiExecutionScanner(Scanner):
                 int((time.monotonic() - clock) * 1000), raw_relative, error=_safe_text(str(exc)),
                 reason_code="api_testing_failed", coverage=artifact["coverage"], schema_version="1"
             ), []
+
+
+class PassiveRuntimeScanner(Scanner):
+    name = "zap-passive"
+    output_name = "zap-passive"
+    version_command = ["/opt/zap/zap.sh", "-version"]
+
+    def can_run(self, context: ScannerContext) -> bool:
+        return os.environ.get("SECURITY_SCAN_ENABLE_PASSIVE_RUNTIME_ANALYSIS", "").lower() == "true"
+
+    def command(self, context: ScannerContext) -> list[str]:
+        return []
+
+    def execute(self, context: ScannerContext) -> tuple[ScannerResult, list[dict[str, Any]]]:
+        self.extra_artifacts = {}
+        result, findings, surface = execute_passive(context)
+        self.extra_artifacts = {"runtimeSurface": surface}
+        return result, findings
 
 
 class TrivyScanner(Scanner):

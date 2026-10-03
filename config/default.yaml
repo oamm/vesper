@@ -19,6 +19,7 @@ timeouts:
   grype: 600
   gitleaks: 600
   scorecard: 600
+  zap-passive: 600
 
 scanner:
   trivy:

@@ -1,0 +1,18 @@
+policy:
+  failOn: []
+  failOnSecrets: false
+  maxHigh: null
+baseline:
+  failOnNew: []
+timeouts:
+  default: 120
+  zap-passive: 120
+scanner:
+  trivy: {enabled: false}
+  osv: {enabled: false}
+  sast: {enabled: false}
+  syft: {enabled: false}
+  grype: {enabled: false}
+  gitleaks: {enabled: false}
+  scorecard: {enabled: false}
+  api_contract: {enabled: false}

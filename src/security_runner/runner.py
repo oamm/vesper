@@ -21,7 +21,9 @@ from security_runner.policy import evaluate
 from security_runner.remediations import PRIORITY_BY_SEVERITY, PRIORITY_ORDER, build_remediations
 from security_runner.components import ComponentError, component_summary, validate_component_inventory
 from security_runner.posture import PostureError, posture_summary, validate_posture
-from security_runner.scanners import ApiContractScanner, ApiExecutionScanner, GitleaksScanner, GrypeScanner, OsvScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
+from security_runner.runtime_target import RuntimeTargetError, load_runtime_target, validate_runtime_target
+from security_runner.runtime_surface import validate_runtime_surface
+from security_runner.scanners import ApiContractScanner, ApiExecutionScanner, GitleaksScanner, GrypeScanner, OsvScanner, PassiveRuntimeScanner, SastScanner, ScorecardScanner, SyftScanner, TrivyScanner
 from security_runner import __version__
 
 EXIT_GATE_FAILED = 1
@@ -39,6 +41,7 @@ SCANNER_CAPABILITIES = {
     "grype": ("dependency",),
     "gitleaks": ("secret",),
     "scorecard": (),
+    "zap-passive": ("runtime_passive",),
 }
 
 
@@ -96,6 +99,10 @@ def run_scan(
     exclude_paths = [output_exclusion] if output_exclusion else []
     baseline_exclusion = os.environ.get("SECURITY_SCAN_BASELINE_RELATIVE_PATH")
     exclude_files = [baseline_exclusion.replace("\\", "/")] if baseline_exclusion else []
+    try:
+        runtime_target = load_runtime_target()
+    except RuntimeTargetError as exc:
+        raise ConfigurationError(str(exc)) from exc
 
     print(f"[runner] Scan {scan_id} started at {started_at_text}", flush=True)
     print("[runner] Detecting project...", flush=True)
@@ -124,12 +131,15 @@ def run_scan(
         scanners = scanner_instances
     if scanner_instances is None and os.environ.get("SECURITY_SCAN_ENABLE_API_TESTING", "").lower() == "true":
         scanners.append(ApiExecutionScanner())
+    if scanner_instances is None and os.environ.get("SECURITY_SCAN_ENABLE_PASSIVE_RUNTIME_ANALYSIS", "").lower() == "true":
+        scanners.append(PassiveRuntimeScanner())
     all_findings: list[dict[str, Any]] = []
     scanner_results = []
     component_inventory = None
     posture = None
     api_contract = None
     api_execution = None
+    runtime_surface = None
     syft_result = None
     for scanner in scanners:
         if scanner.name == "grype" and hasattr(scanner, "set_input_coverage"):
@@ -157,6 +167,10 @@ def run_scan(
             if api_execution is not None:
                 raise ReportConsistencyError("Multiple scanners produced API execution artifacts.")
             api_execution = scanner.extra_artifacts["apiExecution"]
+        if "runtimeSurface" in getattr(scanner, "extra_artifacts", {}):
+            if runtime_surface is not None:
+                raise ReportConsistencyError("Multiple scanners produced runtime surface artifacts.")
+            runtime_surface = scanner.extra_artifacts["runtimeSurface"]
 
     if api_execution is not None and api_contract is not None:
         behavior_findings = normalize_api_behavior(api_execution, api_contract)
@@ -213,12 +227,13 @@ def run_scan(
             comparison_scan,
             project.report(),
             api_execution,
+            runtime_surface,
         )
         if execution_status == "completed":
             gate = _apply_baseline_gate(gate, findings, remediations, comparison, config)
         else:
             gate = {**gate, "baselineDelta": _baseline_delta(comparison, remediations, config)}
-    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config, posture, api_contract, api_execution)
+    summary = _summary(findings, remediations, gate, execution_status, scanner_results, project, component_inventory, config, posture, api_contract, api_execution, runtime_target, runtime_surface)
     if comparison is not None:
         summary["baselineComparison"] = {
             "baselineId": comparison["baseline"]["baselineId"],
@@ -233,6 +248,10 @@ def run_scan(
         report_schemas["apiContract"] = 1
     if api_execution is not None:
         report_schemas["apiExecution"] = 1
+    if runtime_target is not None:
+        report_schemas["runtimeTarget"] = 1
+    if runtime_surface is not None:
+        report_schemas["runtimeSurface"] = 1
     if comparison is not None:
         report_schemas["comparison"] = comparison["schemaVersion"]
     scan_report = {
@@ -256,6 +275,22 @@ def run_scan(
             "contract": api_execution.get("contract"),
             "operations": api_execution.get("operations", []),
         }
+    if runtime_target is not None:
+        scan_report["runtimeTarget"] = {
+            "schemaVersion": runtime_target["schemaVersion"],
+            "target": runtime_target["target"],
+            "authorization": runtime_target["authorization"],
+            "scope": runtime_target["scope"],
+            "authentication": runtime_target["authentication"],
+            "execution": runtime_target["execution"],
+        }
+    if runtime_surface is not None:
+        scan_report["runtimePassive"] = {
+            "schemaVersion": runtime_surface.get("schemaVersion"),
+            "targetId": runtime_surface.get("targetId"),
+            "summary": runtime_surface.get("summary", {}),
+            "passiveOnly": True,
+        }
     repository_metadata = _repository_metadata()
     if repository_metadata:
         scan_report["repository"] = repository_metadata
@@ -266,7 +301,7 @@ def run_scan(
     project_report["projectNameSource"] = "launcher-workspace-directory" if os.environ.get("SECURITY_SCAN_PROJECT_NAME") else "workspace-directory"
     if comparison is not None:
         validate_comparison(comparison, baseline, findings, scan_report)
-    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory, posture, api_contract, api_execution)
+    _validate_report_consistency(project_report, findings, remediations, summary, scan_report, comparison, component_inventory, posture, api_contract, api_execution, runtime_target, runtime_surface)
     (output / "project.json").write_text(json.dumps(project_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "remediations.json").write_text(json.dumps(remediations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -280,6 +315,10 @@ def run_scan(
         (output / "api-contract.json").write_text(json.dumps(api_contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if api_execution is not None:
         (output / "api-execution.json").write_text(json.dumps(api_execution, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if runtime_target is not None:
+        (output / "runtime-target.json").write_text(json.dumps(runtime_target, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if runtime_surface is not None:
+        (output / "runtime-surface.json").write_text(json.dumps(runtime_surface, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if comparison is not None:
         (output / "comparison.json").write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_summary(project.technologies, summary, remediations, scanner_results)
@@ -300,6 +339,8 @@ def _summary(
     posture: dict[str, Any] | None = None,
     api_contract: dict[str, Any] | None = None,
     api_execution: dict[str, Any] | None = None,
+    runtime_target: dict[str, Any] | None = None,
+    runtime_surface: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     severities = {key: 0 for key in ("critical", "high", "medium", "low", "info", "unknown")}
     categories = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
@@ -371,6 +412,15 @@ def _summary(
             "schemaViolations": sum(finding.get("type") == "response_schema_violation" for finding in api_behavior),
             "unexpectedStatus": sum(finding.get("type") == "unexpected_status" for finding in api_behavior),
         }
+    if runtime_target is not None:
+        summary["runtimeTarget"] = {
+            "configured": True,
+            "passiveAuthorized": runtime_target["authorization"]["passive"],
+            "activeAuthorized": runtime_target["authorization"]["active"],
+            "execution": runtime_target["execution"],
+        }
+    if runtime_surface is not None:
+        summary["runtimePassive"] = runtime_surface.get("summary", {}) | {"alerts": sum(1 for finding in findings if finding.get("category") == "runtime_passive")}
     return summary
 
 
@@ -594,6 +644,8 @@ def _validate_report_consistency(
     posture: dict[str, Any] | None = None,
     api_contract: dict[str, Any] | None = None,
     api_execution: dict[str, Any] | None = None,
+    runtime_target: dict[str, Any] | None = None,
+    runtime_surface: dict[str, Any] | None = None,
 ) -> None:
     def require(condition: bool, message: str) -> None:
         if not condition:
@@ -618,7 +670,33 @@ def _validate_report_consistency(
         expected_schemas["apiContract"] = 1
     if api_execution is not None:
         expected_schemas["apiExecution"] = 1
+    if runtime_target is not None:
+        expected_schemas["runtimeTarget"] = 1
+    if runtime_surface is not None:
+        expected_schemas["runtimeSurface"] = 1
     require(scan.get("reportSchemas") == expected_schemas, "Scan report schema manifest is inconsistent.")
+    if runtime_target is None:
+        require("runtimeTarget" not in summary and "runtimeTarget" not in scan, "Runtime target metadata exists without a runtime target artifact.")
+    else:
+        try:
+            validate_runtime_target(runtime_target)
+        except RuntimeTargetError as exc:
+            raise ReportConsistencyError(str(exc)) from exc
+        require(summary.get("runtimeTarget", {}).get("configured") is True, "Runtime target summary is inconsistent.")
+        require(scan.get("runtimeTarget", {}).get("target") == runtime_target.get("target"), "Runtime target metadata is inconsistent.")
+    if runtime_surface is None:
+        require("runtimePassive" not in summary and "runtimePassive" not in scan, "Runtime surface metadata exists without a runtime surface artifact.")
+    else:
+        require(runtime_target is not None, "Runtime surface requires a runtime target artifact.")
+        try:
+            validate_runtime_surface(runtime_surface, runtime_target)
+        except ValueError as exc:
+            raise ReportConsistencyError(str(exc)) from exc
+        require(scan.get("runtimePassive", {}).get("targetId") == runtime_surface.get("targetId"), "Runtime passive metadata is inconsistent.")
+        require(summary.get("runtimePassive", {}).get("discovered") == runtime_surface.get("summary", {}).get("discovered"), "Runtime passive summary is inconsistent.")
+        passive_findings = [finding for finding in findings if finding.get("category") == "runtime_passive"]
+        resource_ids = {item.get("identity") for item in runtime_surface.get("resources", [])}
+        require(all((finding.get("runtimeEvidence") or {}).get("resourceId") in resource_ids for finding in passive_findings), "Passive finding references an unknown runtime resource.")
     if comparison is None:
         require("baselineComparison" not in summary and "baselineId" not in scan, "Baseline metadata exists without a comparison report.")
     else:
@@ -722,8 +800,8 @@ def _validate_report_consistency(
     category_counts = {key: 0 for key in ("sast", "dependency", "secret", "iac", "container")}
     for finding in findings:
         require(finding.get("severity") in severity_counts, "Finding has an unsupported severity.")
-        if finding.get("category") == "api_behavior":
-            category_counts.setdefault("api_behavior", 0)
+        if finding.get("category") in {"api_behavior", "runtime_passive"}:
+            category_counts.setdefault(finding["category"], 0)
         require(finding.get("category") in category_counts, "Finding has an unsupported category.")
         severity_counts[finding["severity"]] += 1
         category_counts[finding["category"]] += 1

@@ -8,6 +8,7 @@ ARG SYFT_VERSION=1.52.0
 ARG GRYPE_VERSION=0.119.0
 ARG GITLEAKS_VERSION=8.30.1
 ARG SCORECARD_VERSION=5.5.0
+ARG ZAP_VERSION=2.17.0
 ARG TARGETARCH=amd64
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -31,8 +32,13 @@ RUN python -c 'import hashlib, os, urllib.request, tarfile; version = os.environ
 RUN python -c 'import hashlib, os, urllib.request, tarfile; arch = os.environ["TARGETARCH"]; version = os.environ["SCORECARD_VERSION"]; filename = f"scorecard_{version}_linux_{arch}.tar.gz"; base = f"https://github.com/ossf/scorecard/releases/download/v{version}"; source = f"/tmp/{filename}"; urllib.request.urlretrieve(f"{base}/{filename}", source); sums = urllib.request.urlopen(f"{base}/scorecard_checksums.txt").read().decode(); expected = next(line.split()[0] for line in sums.splitlines() if len(line.split()) >= 2 and line.split()[-1] == filename); digest = hashlib.file_digest(open(source, "rb"), "sha256").hexdigest(); assert digest == expected, "Scorecard release checksum mismatch"; archive = tarfile.open(source); member = archive.getmember("scorecard"); extracted = archive.extractfile(member); target = open("/usr/local/bin/scorecard", "wb"); target.write(extracted.read()); target.close(); os.chmod("/usr/local/bin/scorecard", 0o755)'
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes git \
+    && apt-get install --no-install-recommends --yes git openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python -c 'import hashlib, urllib.request; source="/tmp/ZAP_2.17.0_Linux.tar.gz"; urllib.request.urlretrieve("https://github.com/zaproxy/zaproxy/releases/download/v2.17.0/ZAP_2.17.0_Linux.tar.gz", source); digest=hashlib.file_digest(open(source, "rb"), "sha256").hexdigest(); assert digest == "efe799aaa3627db683b43f00c9c210aea0b75c00cc8f0a0f0434d12bb3ddde5a", "ZAP release checksum mismatch"'
+RUN mkdir -p /opt/zap \
+    && tar -xzf /tmp/ZAP_2.17.0_Linux.tar.gz --strip-components=1 -C /opt/zap \
+    && rm /tmp/ZAP_2.17.0_Linux.tar.gz
 
 COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/trivy
 

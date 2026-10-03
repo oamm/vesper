@@ -17,6 +17,7 @@ CAPABILITY_BY_CATEGORY = {
     "container": "container",
     "iac": "iac",
     "api_behavior": "api_behavior",
+    "runtime_passive": "runtime_passive",
 }
 SEVERITY_WEIGHT = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 SCANNERS_BY_CAPABILITY = {
@@ -26,6 +27,7 @@ SCANNERS_BY_CAPABILITY = {
     "container": {"trivy"},
     "iac": {"trivy"},
     "api_behavior": {"api-execution"},
+    "runtime_passive": {"zap-passive"},
 }
 
 
@@ -234,6 +236,7 @@ def compare_findings(
     scan: dict[str, Any],
     project: dict[str, Any],
     api_execution: dict[str, Any] | None = None,
+    runtime_surface: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     baseline = validate_baseline(baseline)
     remediation_by_finding = _remediations_by_finding(remediations)
@@ -463,11 +466,12 @@ def _load_scan_artifacts(scan_directory: Path) -> dict[str, Any]:
         raise BaselineError("Scan scanner metadata is malformed.")
     finding_ids = set()
     severity_counts = {severity: 0 for severity in SEVERITY_WEIGHT}
-    categories = set(CAPABILITY_BY_CATEGORY) - {"api_behavior"}
-    if "api_behavior" in summary_findings.get("categories", {}) or any(
-        isinstance(finding, dict) and finding.get("category") == "api_behavior" for finding in findings
-    ):
-        categories.add("api_behavior")
+    categories = set(CAPABILITY_BY_CATEGORY) - {"api_behavior", "runtime_passive"}
+    for optional_category in ("api_behavior", "runtime_passive"):
+        if optional_category in summary_findings.get("categories", {}) or any(
+            isinstance(finding, dict) and finding.get("category") == optional_category for finding in findings
+        ):
+            categories.add(optional_category)
     category_counts = {category: 0 for category in categories}
     for finding in findings:
         if not isinstance(finding, dict) or finding.get("schemaVersion") != 2:
@@ -654,6 +658,8 @@ def _resolution_evidence(
             "state": state,
             "validation": {required: True},
         }
+    if capability == "runtime_passive":
+        return "runtime_resolution_deferred", None
     if capability == "dependency":
         osv = next((scanner for scanner in relevant if scanner.get("name") == "osv-scanner"), None)
         if osv:
