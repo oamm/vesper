@@ -19,6 +19,7 @@ internal static class ReportHtmlWriter
         using var components = LoadOptional(reportDirectory, "components.json");
         using var apiContract = LoadOptional(reportDirectory, "api-contract.json");
         using var apiExecution = LoadOptional(reportDirectory, "api-execution.json");
+        using var comparison = LoadOptional(reportDirectory, "comparison.json");
         var scanRoot = scan.RootElement;
         var gate = summary.TryGetProperty("gate", out var gateValue) ? gateValue : EmptyObject;
         var findingSummary = summary.TryGetProperty("findings", out var nestedFindings) ? nestedFindings : summary;
@@ -30,7 +31,7 @@ internal static class ReportHtmlWriter
         AppendProjectSummary(html, reportDirectory, scanRoot, summary, project, findingSummary);
         AppendAssessments(html, summary, scanRoot, gate, findings.RootElement, blockingIds);
         AppendPolicy(html, summary);
-        AppendComparison(html, comparisonCounts);
+        AppendComparison(html, comparison?.RootElement ?? EmptyObject, comparisonCounts);
         AppendRemediations(html, remediations.RootElement, blockingIds);
         AppendCoverage(html, reportDirectory, outputPath, summary, scanRoot, project);
         AppendComponents(html, components?.RootElement ?? EmptyObject, summary);
@@ -105,12 +106,35 @@ internal static class ReportHtmlWriter
         html.Append("</tbody></table></div><p class=\"muted\">Blocking findings are policy violations. Other findings remain follow-up work even when they do not affect the gate.</p></section>");
     }
 
-    private static void AppendComparison(StringBuilder html, IReadOnlyDictionary<string, int>? counts)
+    private static void AppendComparison(StringBuilder html, JsonElement comparison, IReadOnlyDictionary<string, int>? counts)
     {
         if (counts is null) return;
         html.Append("<section aria-labelledby=\"comparison-heading\"><h2 id=\"comparison-heading\">Baseline comparison</h2><div class=\"cards\">");
         foreach (var state in new[] { "new", "existing", "changed", "resolved", "unverified" }) Card(html, state, counts.TryGetValue(state, out var value) ? value.ToString() : "Not recorded");
-        html.Append("</div></section>");
+        html.Append("</div>");
+        var apiRecords = new List<(string State, string Operation, string Behavior, string Reason)>();
+        if (comparison.ValueKind == JsonValueKind.Object && comparison.TryGetProperty("findings", out var groups) && groups.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var state in new[] { "new", "existing", "changed", "resolved", "unverified" })
+            {
+                if (!groups.TryGetProperty(state, out var records) || records.ValueKind != JsonValueKind.Array) continue;
+                foreach (var record in records.EnumerateArray())
+                {
+                    var detail = record.TryGetProperty("baselineFinding", out var baseline) && baseline.ValueKind == JsonValueKind.Object ? baseline : record;
+                    if (Text(detail, "category") != "api_behavior") continue;
+                    var evidence = detail.TryGetProperty("behaviorEvidence", out var behaviorEvidence) && behaviorEvidence.ValueKind == JsonValueKind.Object ? behaviorEvidence : EmptyObject;
+                    apiRecords.Add((state, Text(evidence, "operation", Text(detail, "target", "Not recorded")), Text(evidence, "behaviorType", "Not recorded"), Text(record, "reasonCode", "")));
+                }
+            }
+        }
+        if (apiRecords.Count > 0)
+        {
+            html.Append("<h3>API behavioral comparison</h3><div class=\"table-wrap\"><table><thead><tr><th>State</th><th>Operation</th><th>Behavior</th><th>Reason</th></tr></thead><tbody>");
+            foreach (var item in apiRecords.OrderBy(item => item.State).ThenBy(item => item.Operation).ThenBy(item => item.Behavior))
+                html.Append("<tr><td>").Append(E(item.State)).Append("</td><td class=\"code\">").Append(E(item.Operation)).Append("</td><td>").Append(E(item.Behavior)).Append("</td><td>").Append(E(string.IsNullOrEmpty(item.Reason) ? "Positive runtime coverage" : item.Reason)).Append("</td></tr>");
+            html.Append("</tbody></table></div>");
+        }
+        html.Append("</section>");
     }
 
     private static void AppendRemediations(StringBuilder html, JsonElement remediations, HashSet<string> blockingIds)
@@ -258,7 +282,7 @@ internal static class ReportHtmlWriter
         if (findings.ValueKind != JsonValueKind.Array) return;
         var behavioral = findings.EnumerateArray().Where(item => Text(item, "category") == "api_behavior").ToArray();
         if (behavioral.Length == 0) return;
-        html.Append("<section aria-labelledby=\"api-behavior-heading\"><h2 id=\"api-behavior-heading\">API behavioral findings</h2><p class=\"muted\">These findings are deterministic contract/runtime mismatches. They are not API baseline states yet.</p><div class=\"cards\">");
+        html.Append("<section aria-labelledby=\"api-behavior-heading\"><h2 id=\"api-behavior-heading\">API behavioral findings</h2><p class=\"muted\">These findings are deterministic contract/runtime mismatches. Baseline state details appear in the comparison section when a baseline is supplied.</p><div class=\"cards\">");
         Card(html, "Behavioral findings", behavioral.Length.ToString());
         Card(html, "Unexpected 5xx", behavioral.Count(item => Text(item, "type") == "unexpected_5xx").ToString());
         Card(html, "Schema violations", behavioral.Count(item => Text(item, "type") == "response_schema_violation").ToString());

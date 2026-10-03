@@ -503,6 +503,7 @@ internal static class Program
                 }
                 parsedCounts.Add(state, count);
             }
+            if (!ValidateApiResolvedComparison(groups, scan)) return false;
             counts = parsedCounts;
             return true;
         }
@@ -548,6 +549,42 @@ internal static class Program
                 .SequenceEqual(scanDelta.GetProperty("failOnNew").EnumerateArray().Select(item => item.GetString()))
             && summaryDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString())
                 .SequenceEqual(scanDelta.GetProperty("blockingFindingIds").EnumerateArray().Select(item => item.GetString()));
+    }
+
+    private static bool ValidateApiResolvedComparison(JsonElement groups, JsonElement scan)
+    {
+        if (!groups.TryGetProperty("resolved", out var resolved) || resolved.ValueKind != JsonValueKind.Array) return false;
+        foreach (var record in resolved.EnumerateArray())
+        {
+            if (!record.TryGetProperty("baselineFinding", out var baseline) || baseline.ValueKind != JsonValueKind.Object) return false;
+            if (!baseline.TryGetProperty("category", out var category) || category.GetString() != "api_behavior") continue;
+            if (!baseline.TryGetProperty("behaviorEvidence", out var behavior) || behavior.ValueKind != JsonValueKind.Object
+                || !behavior.TryGetProperty("operation", out var operation) || operation.ValueKind != JsonValueKind.String
+                || !behavior.TryGetProperty("behaviorType", out var behaviorType) || behaviorType.ValueKind != JsonValueKind.String) return false;
+            if (!scan.TryGetProperty("apiExecution", out var execution) || execution.ValueKind != JsonValueKind.Object
+                || !execution.TryGetProperty("activeTesting", out var active) || active.ValueKind != JsonValueKind.True
+                || execution.TryGetProperty("status", out var executionStatus) && executionStatus.ValueKind == JsonValueKind.String && executionStatus.GetString() == "failed") return false;
+            if (!execution.TryGetProperty("operations", out var operations) || operations.ValueKind != JsonValueKind.Array) return false;
+            JsonElement? operationRecord = null;
+            foreach (var candidate in operations.EnumerateArray())
+            {
+                if (candidate.TryGetProperty("operation", out var candidateOperation) && candidateOperation.GetString() == operation.GetString())
+                {
+                    operationRecord = candidate;
+                    break;
+                }
+            }
+            if (operationRecord is null || !operationRecord.Value.TryGetProperty("state", out var state) || state.GetString() != "exercised") return false;
+            if (!operationRecord.Value.TryGetProperty("validation", out var validation) || validation.ValueKind != JsonValueKind.Object) return false;
+            var required = behaviorType.GetString() switch
+            {
+                "unexpected_5xx" or "unexpected_status" => "statusValidation",
+                "response_schema_violation" => "responseSchemaValidation",
+                _ => null,
+            };
+            if (required is null || !validation.TryGetProperty(required, out var validated) || validated.ValueKind != JsonValueKind.True) return false;
+        }
+        return true;
     }
 
     private static bool ValidateSavedArtifacts(string reportDirectory, JsonElement scan, JsonElement summary)

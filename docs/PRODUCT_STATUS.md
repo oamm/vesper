@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-10-02
 **Current version:** 0.2.0
-**Current milestone:** M4 - API Security and Fuzzing (IN PROGRESS)
-**Overall status:** M3 COMPLETE; M4 IN PROGRESS
+**Current milestone:** M5 - DAST and Runtime Security (PLANNED)
+**Overall status:** M4 COMPLETE; M5 PLANNED
 
 ## Product Goal
 
@@ -351,7 +351,7 @@ M3 exit criteria are complete: each M3 slice has accepted evidence; the integrat
 
 ### M4 - API Security and Fuzzing
 
-**Status:** IN PROGRESS
+**Status:** COMPLETE
 
 **Goal:** Use API contracts to deterministically exercise application behavior.
 
@@ -359,7 +359,7 @@ M3 exit criteria are complete: each M3 slice has accepted evidence; the integrat
 
 **Potential scope:** OpenAPI discovery; REST API test generation; negative testing; boundary-value testing; schema validation; unexpected response detection; and unexpected 5xx detection.
 
-Active testing is implemented only through M4.2's explicit authorization and runtime-target boundary. M4.3 normalizes deterministic runtime contract failures; M4.4 API baseline semantics remain future work.
+Active testing is implemented only through M4.2's explicit authorization and runtime-target boundary. M4.3 normalizes deterministic runtime contract failures; M4.4 extends the existing baseline model with coverage-aware API comparison.
 
 M4 decomposition:
 
@@ -373,10 +373,10 @@ M4.2 Schemathesis Execution             COMPLETE
 M4.3 Behavioral Evidence                COMPLETE
      schema violations, unexpected status codes, 5xx,
      reproducible cases, evidence redaction
-M4.4 API Coverage and Baseline          PLANNED
+M4.4 API Coverage and Baseline          COMPLETE
      attempted/exercised operations, auth-limited coverage,
      comparison semantics
-M4.5 M4 Integration and Acceptance      PLANNED
+M4.5 M4 Integration and Acceptance      COMPLETE
      integrated fixtures, HTML, policy interaction, real test API
 ```
 
@@ -398,7 +398,7 @@ M4.2 adds Schemathesis 3.39.16 behind an explicit active-testing boundary. HTTP 
 
 The versioned `api-execution.json` artifact links to the M4.1 contract digest and operation identities, and keeps runtime coverage separate from contract coverage. It records exercised, auth-limited, failed, and not-attempted operation states plus bounded candidate runtime evidence (`unexpected_5xx`, response-schema violations, timeouts, and connection failures); M4.3 promotes only deterministic contract mismatches into findings. Native runtime evidence is retained in `raw/schemathesis.json` without request credentials or full request/response bodies. Passive contract-only scans remain network-free and do not emit runtime execution artifacts.
 
-The M4.2 fixture acceptance covered public and bearer-protected operations, missing and configured authentication, deterministic 5xx and response-schema evidence, target URL validation, cross-origin redirect containment, credential redaction, and real Schemathesis execution. Python tests passed 90; launcher parsing/build acceptance passed; the rebuilt runner image `vesper-runner:m42` installed the pinned hash-locked dependency set and completed successfully. M4.2 does not add API baseline states or advanced policy; those remain M4.4/M8 work.
+The M4.2 fixture acceptance covered public and bearer-protected operations, missing and configured authentication, deterministic 5xx and response-schema evidence, target URL validation, cross-origin redirect containment, credential redaction, and real Schemathesis execution. Python tests passed 90; launcher parsing/build acceptance passed; the rebuilt runner image `vesper-runner:m42` installed the pinned hash-locked dependency set and completed successfully. M4.2 did not add API baseline states or advanced policy; M4.4 now owns API baseline comparison and M8 remains future advanced policy work.
 
 #### M4.3 - Behavioral Evidence
 
@@ -408,7 +408,27 @@ M4.3 promotes only `unexpected_5xx`, `response_schema_violation`, and `unexpecte
 
 Behavioral identity is based on the contract operation identity, behavior type, and sorted expected response statuses. Target origin, concrete generated values, case IDs, timestamps, response bodies, and execution order are excluded. Multiple cases are deduplicated into one finding with at most three sorted, redacted reproduction examples. Findings retain the contract digest, `apiIdentityVersion`, operation reference, observed statuses, candidate/retained counts, and bounded validation text; no raw credentials or full bodies are persisted.
 
-Behavioral findings generate normal remediation groups and are rendered separately from API contract and active execution sections in HTML. Cross-artifact validation checks operation and execution-event references. Existing M2 comparison intentionally excludes `api_behavior` findings until M4.4 defines API baseline semantics; baseline creation likewise excludes them rather than misclassifying them. The representative fixture produced two deterministic unexpected-5xx findings, two remediations, saved report/HTML/gate reproduction, and no credential leakage. M4.4 remains responsible for behavioral baseline and coverage comparison.
+Behavioral findings generate normal remediation groups and are rendered separately from API contract and active execution sections in HTML. Cross-artifact validation checks operation and execution-event references. M4.4 now includes these findings in the existing baseline model without changing M2 schema v1: semantic identity is operation/behavior/expectation based, generated values and targets are excluded, and API resolution requires positive operation and behavior-validation coverage. The representative fixture produced two deterministic unexpected-5xx findings, two remediations, saved report/HTML/gate reproduction, and no credential leakage.
+
+#### M4.4 - API Coverage and Baseline
+
+**Status:** COMPLETE
+
+API behavioral findings now participate in `baseline.json` and `comparison.json` using the existing M2 schema and five comparison states. API identity is scanner-neutral and target-independent: operation identity, behavior type, and stable expected-response metadata define the baseline identity; detector, target, generated values, timestamps, and case IDs do not.
+
+Resolution is conservative and requires positive evidence from the current active execution. The same operation must be exercised and the relevant validation must be available: status validation for `unexpected_5xx`/`unexpected_status`, or response-schema validation for `response_schema_violation`. Auth-limited, not-attempted, failed, passive, missing-operation, and unavailable-validation cases become `UNVERIFIED`; absence alone never becomes `RESOLVED`. Resolved entries preserve bounded baseline evidence and resolution coverage, and saved comparison validation rejects impossible API resolutions.
+
+Old baselines remain readable, non-API findings retain M2 behavior, and API findings are excluded only from no baseline-era artifacts because they did not exist there. API baseline states are rendered in the existing HTML comparison section. API-specific policy and advanced gating remain out of scope for M4.4.
+
+#### M4.5 - M4 Integration and Acceptance
+
+**Status:** COMPLETE
+
+The controlled API fixture acceptance exercised the complete M4 path: passive OpenAPI ingestion, explicit active authorization and target selection, real Schemathesis execution, runtime coverage, behavioral normalization, remediation grouping, baseline creation, unchanged comparison, saved report/gate reproduction, and HTML rendering. The fixture included `GET /health`, authenticated `GET /loans/{id}`, mutating `POST /loans`, global and operation-level security, local references, response schemas, and a production-looking server URL that was never used as an execution target.
+
+Passive scans remained network-free and emitted no behavioral findings. Active unauthenticated runs classified protected operations as `auth_limited`; authenticated credentials were supplied through environment variables and were absent from persisted artifacts, logs, and HTML. Redirects remained contained, and read-only execution left mutating operations unattempted. Deterministic 5xx and schema failures produced bounded, deduplicated `api_behavior` findings and separate remediations.
+
+The integrated runner acceptance used Scan A `230b348c-578e-48f4-8cdc-748ae04c1c5c` and unchanged Scan B `3c548ead-c184-4e3f-8422-1adf7ac56ab0`, with baseline `baseline-1e9935b42808bca5f59cf1c3bfee9621d5d07fc04d80a7e066ee8ba6caf617ae`. It emitted two behavioral findings and two remediations from four total fixture requests; the rerun produced `NEW=0`, `EXISTING=2`, `CHANGED=0`, `RESOLVED=0`, `UNVERIFIED=0`. M4.4 matrix tests covered new, changed, resolved, passive, auth-limited, runtime-failed, validation-unavailable, and impossible-resolution cases. Saved comparison validation rejects API `RESOLVED` entries without positive operation and validation coverage. M4.5 adds no API-specific policy, no new scanner, and no M7 correlation.
 
 ### M5 - DAST and Runtime Security
 
@@ -600,12 +620,12 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 ## Deferred Work
 
-- M4.4-M9 API baseline semantics, runtime, infrastructure, correlation, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred. Large artifact/SBOM scans may require an explicit memory override above the bounded 4 GiB default.
+- M5-M9 DAST, infrastructure, correlation, policy, and CI/CD distribution milestones remain future work; M10 centralized orchestration is deferred. Large artifact/SBOM scans may require an explicit memory override above the bounded 4 GiB default.
 - Additional scanners, shared scanner caches, and an orphan cleanup command remain future work.
 
 ## Not Implemented Yet
 
-- API baseline semantics, OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service remain unimplemented.
+- OWASP ZAP, Nuclei, kube-bench, deterministic evidence correlation, advanced gating, official CI/CD integrations, central API, database, queues, distributed workers, and hosted multi-user service remain unimplemented.
 
 ## Product Readiness
 
@@ -621,7 +641,7 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 
 1. Preserve the completed M2 baseline/diff and new-finding gate evidence while monitoring dynamic scanner data changes.
 2. Keep macOS runtime/AOT and real Docker daemon-disappearance verification as explicit environment/platform validation work.
-3. Keep M4.1 passive contract evidence, M4.2 bounded execution, and M4.3 behavioral findings under explicit authorization; begin M4.4 only when API baseline semantics are explicitly scoped.
+3. Preserve the completed M4 API contract, bounded execution, behavioral evidence, and conservative baseline acceptance; scope M5 DAST separately before implementation and keep active testing explicitly authorized.
 4. Do not begin CI/CD ecosystem packaging until M9 unless a small CI smoke test is required to validate an earlier product invariant.
 
 ## Future Development Workflow
@@ -660,3 +680,5 @@ Vesper is not differentiated by scanner count. Its architectural value is determ
 - Completed M4.1 API Contract Foundation with passive local OpenAPI 3 JSON/YAML ingestion, bounded deterministic operation/security normalization, explicit contract coverage, safe local-reference handling, no network access, versioned `api-contract.json`, summary/HTML integration, saved-artifact validation, 84 Python tests, launcher acceptance, and a rebuilt `vesper-runner:m41` image. M4.2 Schemathesis execution and all HTTP behavior remain planned and were not started.
 - Completed M4.2 Schemathesis Execution with pinned hash-locked Schemathesis 3.39.16, explicit opt-in plus runtime-target authorization, bounded read-only/all execution, secure bearer/API-key environment inputs, target/redirect scope controls, versioned `api-execution.json`, credential-safe raw runtime evidence, contract-linked operation/runtime coverage, candidate 5xx/schema evidence, 90 Python tests, launcher acceptance, and a rebuilt `vesper-runner:m42` image. M4.3 behavioral finding normalization and M4.4 API baseline semantics remain planned.
 - Completed M4.3 Behavioral Evidence with deterministic `api_behavior` normalization for unexpected 5xx, response-schema violation, and unexpected-status evidence; target-independent operation fingerprints; multi-case deduplication with bounded redacted reproductions; generic severity/remediation integration; cross-artifact validation; HTML behavioral reporting; explicit exclusion from M2 baseline comparison until M4.4; 93 Python tests; launcher acceptance/build; saved report/HTML/gate reproduction; and a representative real Schemathesis fixture.
+- Completed M4.4 API Coverage and Baseline with additive M2-schema API behavioral baseline entries, target- and generated-value-independent identity, positive operation/behavior-validation resolution evidence, conservative `UNVERIFIED` handling for passive/auth-limited/not-attempted/failed coverage, old-baseline compatibility, mixed finding comparison, saved comparison validation, API baseline HTML details, and 94 passing Python tests. M4.5 remains planned and was not started.
+- Completed M4.5 M4 Integration and Acceptance with the real controlled API fixture, passive/active authorization regressions, runtime coverage and credential-safety checks, deterministic behavioral findings/remediations, integrated baseline rerun, saved report/HTML/gate validation, impossible-resolution rejection, launcher acceptance, runner build, and 95 passing Python tests. M4 is complete; M5 remains planned and was not started.
