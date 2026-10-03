@@ -10,6 +10,17 @@ public sealed record LaunchOptions(
     string Image,
     string? ConfigPath,
     string? BaselinePath,
+    string? ApiContractPath,
+    bool EnableApiTesting,
+    string? ApiTarget,
+    string ApiTestMode,
+    string? ApiBearerEnvironment,
+    string? ApiKeyHeader,
+    string? ApiKeyEnvironment,
+    int ApiMaxExamples,
+    int ApiMaxRequests,
+    double ApiRequestTimeout,
+    double ApiGlobalTimeout,
     ScanResourceLimits ResourceLimits,
     WorkspaceTransferLimits TransferLimits);
 
@@ -59,6 +70,22 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
             if ((File.GetAttributes(baselinePath) & FileAttributes.ReparsePoint) != 0)
             {
                 throw new BaselineInputException("Baseline file cannot be a symlink or reparse point.");
+            }
+        }
+        string? apiContractPath = null;
+        if (options.ApiContractPath is not null)
+        {
+            apiContractPath = Path.GetFullPath(options.ApiContractPath);
+            if (!File.Exists(apiContractPath))
+            {
+                throw new FileNotFoundException($"API contract file was not found: {apiContractPath}");
+            }
+            var contractRelativePath = Path.GetRelativePath(workspace, apiContractPath);
+            if (Path.IsPathRooted(contractRelativePath)
+                || contractRelativePath == ".."
+                || contractRelativePath.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("--api-contract must remain inside the workspace.");
             }
         }
         string? baselineExclusionPath = null;
@@ -123,10 +150,10 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
 
         if (mode == WorkspaceMode.Bind)
         {
-            return await RunWithBindMountsAsync(execution, configPath, baselinePath, baselineExclusionPath, cancellationToken);
+            return await RunWithBindMountsAsync(execution, configPath, baselinePath, baselineExclusionPath, apiContractPath, cancellationToken);
         }
 
-        return await RunWithVolumesAsync(execution, configPath, baselinePath, baselineExclusionPath, cancellationToken);
+        return await RunWithVolumesAsync(execution, configPath, baselinePath, baselineExclusionPath, apiContractPath, cancellationToken);
     }
 
     private async Task<int> RunWithBindMountsAsync(
@@ -134,9 +161,10 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         string? configPath,
         string? baselinePath,
         string? baselineExclusionPath,
+        string? apiContractPath,
         CancellationToken cancellationToken)
     {
-        var arguments = ScannerRunArguments(execution, baselineExclusionPath);
+        var arguments = ScannerRunArguments(execution, baselineExclusionPath, apiContractPath);
         arguments.Add("--mount");
         arguments.Add(DockerMountArguments.Bind(execution.SourcePath, "/workspace", readOnly: true));
         arguments.Add("--mount");
@@ -176,6 +204,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         string? configPath,
         string? baselinePath,
         string? baselineExclusionPath,
+        string? apiContractPath,
         CancellationToken cancellationToken)
     {
         var sourceVolume = execution.SourceVolumeName!;
@@ -220,7 +249,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
                 await docker.UploadArchiveAsync(LauncherImages.ArchiveHelper, configVolume, "/security-config", configArchive, configUploadName, execution, "config-upload", cancellationToken);
             }
 
-            var scanArguments = ScannerRunArguments(execution, baselineExclusionPath);
+            var scanArguments = ScannerRunArguments(execution, baselineExclusionPath, apiContractPath);
             scanArguments.Add("--mount");
             scanArguments.Add(DockerMountArguments.Volume(sourceVolume, "/workspace", readOnly: true));
             scanArguments.Add("--mount");
@@ -478,7 +507,7 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         }
     }
 
-    private List<string> ScannerRunArguments(ScanExecutionContext execution, string? baselineExclusionPath)
+    private List<string> ScannerRunArguments(ScanExecutionContext execution, string? baselineExclusionPath, string? apiContractPath)
     {
         var arguments = new List<string>
         {
@@ -511,6 +540,45 @@ public sealed class ScanLauncher(LaunchOptions options, DockerClient? dockerClie
         {
             arguments.Add("--env");
             arguments.Add($"SECURITY_SCAN_BASELINE_RELATIVE_PATH={baselineExclusionPath}");
+        }
+        if (apiContractPath is not null)
+        {
+            var relative = Path.GetRelativePath(options.Workspace, apiContractPath).Replace('\\', '/');
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_CONTRACT={relative}");
+        }
+        if (options.EnableApiTesting)
+        {
+            arguments.Add("--env");
+            arguments.Add("SECURITY_SCAN_ENABLE_API_TESTING=true");
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_TARGET={options.ApiTarget}");
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_TEST_MODE={options.ApiTestMode}");
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_MAX_EXAMPLES={options.ApiMaxExamples}");
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_MAX_REQUESTS={options.ApiMaxRequests}");
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_REQUEST_TIMEOUT={options.ApiRequestTimeout.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+            arguments.Add("--env");
+            arguments.Add($"SECURITY_SCAN_API_GLOBAL_TIMEOUT={options.ApiGlobalTimeout.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+            if (options.ApiBearerEnvironment is not null)
+            {
+                arguments.Add("--env");
+                arguments.Add($"SECURITY_SCAN_API_BEARER_ENV={options.ApiBearerEnvironment}");
+                arguments.Add("--env");
+                arguments.Add(options.ApiBearerEnvironment);
+            }
+            if (options.ApiKeyHeader is not null && options.ApiKeyEnvironment is not null)
+            {
+                arguments.Add("--env");
+                arguments.Add($"SECURITY_SCAN_API_KEY_HEADER={options.ApiKeyHeader}");
+                arguments.Add("--env");
+                arguments.Add($"SECURITY_SCAN_API_KEY_ENV={options.ApiKeyEnvironment}");
+                arguments.Add("--env");
+                arguments.Add(options.ApiKeyEnvironment);
+            }
         }
         return arguments;
     }

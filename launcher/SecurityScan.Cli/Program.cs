@@ -129,6 +129,17 @@ internal static class Program
         var image = LauncherImages.DefaultRunner;
         string? config = null;
         string? baseline = null;
+        string? apiContract = null;
+        var enableApiTesting = false;
+        string? apiTarget = null;
+        var apiTestMode = "read-only";
+        string? apiBearerEnvironment = null;
+        string? apiKeyHeader = null;
+        string? apiKeyEnvironment = null;
+        var apiMaxExamples = 2;
+        var apiMaxRequests = 20;
+        var apiRequestTimeout = 10d;
+        var apiGlobalTimeout = 60d;
         var cpus = ScanResourceLimits.Default.Cpus;
         var memory = ScanResourceLimits.Default.Memory;
         var pidsLimit = ScanResourceLimits.Default.PidsLimit.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -165,6 +176,20 @@ internal static class Program
                     break;
                 case "--config": config = Value(); break;
                 case "--baseline": baseline = Value(); break;
+                case "--api-contract": apiContract = Value(); break;
+                case "--enable-api-testing": enableApiTesting = true; break;
+                case "--api-target": apiTarget = Value(); break;
+                case "--api-test-mode":
+                    apiTestMode = Value().ToLowerInvariant();
+                    if (apiTestMode is not ("read-only" or "all")) throw new ArgumentException("--api-test-mode must be read-only or all.");
+                    break;
+                case "--api-bearer-env": apiBearerEnvironment = Value(); break;
+                case "--api-key-header": apiKeyHeader = Value(); break;
+                case "--api-key-env": apiKeyEnvironment = Value(); break;
+                case "--api-max-examples": apiMaxExamples = ParseApiInt(Value(), "--api-max-examples", 1, 100); break;
+                case "--api-max-requests": apiMaxRequests = ParseApiInt(Value(), "--api-max-requests", 1, 1000); break;
+                case "--api-request-timeout": apiRequestTimeout = ParseApiDouble(Value(), "--api-request-timeout", 0.1, 300); break;
+                case "--api-timeout": apiGlobalTimeout = ParseApiDouble(Value(), "--api-timeout", 0.1, 3600); break;
                 case "--image": image = Value(); break;
                 case "--cpus": cpus = Value(); break;
                 case "--memory": memory = Value(); break;
@@ -192,6 +217,23 @@ internal static class Program
             }
         }
 
+        if (enableApiTesting != (apiTarget is not null))
+            throw new ArgumentException("--enable-api-testing and --api-target must be supplied together; neither alone authorizes requests.");
+        if ((apiKeyHeader is null) != (apiKeyEnvironment is null))
+            throw new ArgumentException("--api-key-header and --api-key-env must be supplied together.");
+        if (apiTarget is not null)
+        {
+            if (!Uri.TryCreate(apiTarget, UriKind.Absolute, out var parsedTarget)
+                || parsedTarget.Scheme is not ("http" or "https")
+                || !string.IsNullOrEmpty(parsedTarget.UserInfo)
+                || !string.IsNullOrEmpty(parsedTarget.Query)
+                || !string.IsNullOrEmpty(parsedTarget.Fragment)
+                || string.IsNullOrWhiteSpace(parsedTarget.Host))
+            {
+                throw new ArgumentException("--api-target must be an absolute http/https URL without credentials, query, or fragment data.");
+            }
+        }
+
         return new LaunchOptions(
             Path.GetFullPath(workspace ?? "."),
             output is null ? null : Path.GetFullPath(output),
@@ -202,8 +244,33 @@ internal static class Program
             image,
             config,
             baseline,
+            apiContract,
+            enableApiTesting,
+            apiTarget,
+            apiTestMode,
+            apiBearerEnvironment,
+            apiKeyHeader,
+            apiKeyEnvironment,
+            apiMaxExamples,
+            apiMaxRequests,
+            apiRequestTimeout,
+            apiGlobalTimeout,
             ScanResourceLimits.Parse(cpus, memory, pidsLimit),
             WorkspaceTransferLimits.Parse(maxWorkspaceBytes, maxFiles, maxFileBytes, maxOutputBytes, maxOutputFiles, maxEntries));
+    }
+
+    private static int ParseApiInt(string value, string option, int minimum, int maximum)
+    {
+        if (!int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed) || parsed < minimum || parsed > maximum)
+            throw new ArgumentException($"{option} must be between {minimum} and {maximum}.");
+        return parsed;
+    }
+
+    private static double ParseApiDouble(string value, string option, double minimum, double maximum)
+    {
+        if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsed) || double.IsNaN(parsed) || double.IsInfinity(parsed) || parsed < minimum || parsed > maximum)
+            throw new ArgumentException($"{option} must be between {minimum} and {maximum}.");
+        return parsed;
     }
 
     private static void PrintHelp()
@@ -221,6 +288,17 @@ internal static class Program
         Console.WriteLine("  --workspace-mode MODE     auto, bind, or volume (default: auto)");
         Console.WriteLine("  --config PATH             Optional local scanner YAML configuration");
         Console.WriteLine("  --baseline PATH           Compare against a versioned baseline artifact");
+        Console.WriteLine("  --api-contract PATH       Import a local OpenAPI 3 contract (passive only)");
+        Console.WriteLine("  --enable-api-testing      Explicitly authorize bounded active API testing");
+        Console.WriteLine("  --api-target URL          Explicit http/https runtime target (required with opt-in)");
+        Console.WriteLine("  --api-test-mode MODE      read-only or all (default: read-only)");
+        Console.WriteLine("  --api-bearer-env NAME     Environment variable containing a bearer token");
+        Console.WriteLine("  --api-key-header NAME     API-key header (requires --api-key-env)");
+        Console.WriteLine("  --api-key-env NAME        Environment variable containing an API key");
+        Console.WriteLine("  --api-max-examples N      Generated cases per operation (default: 2)");
+        Console.WriteLine("  --api-max-requests N      Total request ceiling (default: 20)");
+        Console.WriteLine("  --api-request-timeout S   Per-request timeout seconds (default: 10)");
+        Console.WriteLine("  --api-timeout S           Total API execution timeout seconds (default: 60)");
         Console.WriteLine("  --include-git             Include .git history in volume staging");
         Console.WriteLine("  --keep-volumes            Keep temporary Docker volumes and print their names");
         Console.WriteLine($"  --image IMAGE             Scanner image (default: {LauncherImages.DefaultRunner})");
@@ -484,13 +562,21 @@ internal static class Program
             foreach (var schema in schemas.EnumerateObject())
             {
                 var required = schema.Name is "project" or "scan" or "findings" or "remediations" or "summary"
-                    || schema.Name is "components" or "posture" or "comparison";
+                    || schema.Name is "components" or "posture" or "apiContract" or "apiExecution" or "comparison";
                 if (!required) continue;
-                var file = Path.Combine(reportDirectory, schema.Name + ".json");
+                var fileName = schema.Name switch
+                {
+                    "apiContract" => "api-contract.json",
+                    "apiExecution" => "api-execution.json",
+                    _ => schema.Name + ".json",
+                };
+                var file = Path.Combine(reportDirectory, fileName);
                 if (!File.Exists(file)) return false;
                 using var document = JsonDocument.Parse(File.ReadAllText(file));
                 if (schema.Name == "components" && (!document.RootElement.TryGetProperty("schemaVersion", out var componentVersion) || componentVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("components", out var components) || components.ValueKind != JsonValueKind.Array)) return false;
                 if (schema.Name == "posture" && (!document.RootElement.TryGetProperty("schemaVersion", out var postureVersion) || postureVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("checks", out var checks) || checks.ValueKind != JsonValueKind.Array)) return false;
+                if (schema.Name == "apiContract" && (!document.RootElement.TryGetProperty("schemaVersion", out var apiVersion) || apiVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("operations", out var operations) || operations.ValueKind != JsonValueKind.Array)) return false;
+                if (schema.Name == "apiExecution" && (!document.RootElement.TryGetProperty("schemaVersion", out var executionVersion) || executionVersion.GetInt32() != 1 || !document.RootElement.TryGetProperty("operations", out var executionOperations) || executionOperations.ValueKind != JsonValueKind.Array || !document.RootElement.TryGetProperty("contract", out var executionContract) || !executionContract.TryGetProperty("digest", out _))) return false;
             }
 
             if (scan.TryGetProperty("scanners", out var scanners))

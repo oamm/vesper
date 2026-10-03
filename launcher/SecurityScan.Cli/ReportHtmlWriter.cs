@@ -7,7 +7,7 @@ namespace Vesper.Cli;
 internal static class ReportHtmlWriter
 {
     private static readonly string[] SeverityValues = ["critical", "high", "medium", "low", "info", "unknown"];
-    private static readonly string[] CategoryValues = ["dependency", "secret", "sast", "iac", "container"];
+    private static readonly string[] CategoryValues = ["dependency", "secret", "sast", "iac", "container", "api_behavior"];
 
     public static void Write(string reportDirectory, string outputPath, JsonElement summary, IReadOnlyDictionary<string, int>? comparisonCounts)
     {
@@ -17,6 +17,8 @@ internal static class ReportHtmlWriter
         using var project = LoadOptional(reportDirectory, "project.json");
         using var posture = LoadOptional(reportDirectory, "posture.json");
         using var components = LoadOptional(reportDirectory, "components.json");
+        using var apiContract = LoadOptional(reportDirectory, "api-contract.json");
+        using var apiExecution = LoadOptional(reportDirectory, "api-execution.json");
         var scanRoot = scan.RootElement;
         var gate = summary.TryGetProperty("gate", out var gateValue) ? gateValue : EmptyObject;
         var findingSummary = summary.TryGetProperty("findings", out var nestedFindings) ? nestedFindings : summary;
@@ -32,6 +34,9 @@ internal static class ReportHtmlWriter
         AppendRemediations(html, remediations.RootElement, blockingIds);
         AppendCoverage(html, reportDirectory, outputPath, summary, scanRoot, project);
         AppendComponents(html, components?.RootElement ?? EmptyObject, summary);
+        AppendApiContract(html, apiContract?.RootElement ?? EmptyObject, reportDirectory, outputPath);
+        AppendApiExecution(html, apiExecution?.RootElement ?? EmptyObject, reportDirectory, outputPath);
+        AppendApiBehavior(html, findings.RootElement);
         AppendSecretHistory(html, findings.RootElement, reportDirectory, outputPath);
         AppendPosture(html, posture?.RootElement ?? EmptyObject);
         AppendFindings(html, findings.RootElement, remediations.RootElement, blockingIds);
@@ -206,6 +211,66 @@ internal static class ReportHtmlWriter
         html.Append("</div><p><strong>Native evidence:</strong> ").Append(ArtifactLink(reportDirectory, outputPath, "raw/gitleaks.json")).Append("</p></section>");
     }
 
+    private static void AppendApiContract(StringBuilder html, JsonElement contract, string reportDirectory, string outputPath)
+    {
+        if (contract.ValueKind != JsonValueKind.Object) return;
+        var operations = contract.TryGetProperty("operations", out var values) && values.ValueKind == JsonValueKind.Array ? values : EmptyObject;
+        html.Append("<section aria-labelledby=\"api-contract-heading\"><h2 id=\"api-contract-heading\">API contract</h2><p class=\"muted\">This is passive OpenAPI contract evidence. Contract servers do not authorize runtime requests.</p><div class=\"cards\">");
+        Card(html, "Operations", operations.ValueKind == JsonValueKind.Array ? operations.GetArrayLength().ToString() : "0");
+        Card(html, "Authenticated", operations.ValueKind == JsonValueKind.Array ? operations.EnumerateArray().Count(item => Text(item, "authentication") == "authenticated").ToString() : "0");
+        Card(html, "Public", operations.ValueKind == JsonValueKind.Array ? operations.EnumerateArray().Count(item => Text(item, "authentication") == "public").ToString() : "0");
+        Card(html, "Unknown auth", operations.ValueKind == JsonValueKind.Array ? operations.EnumerateArray().Count(item => Text(item, "authentication") == "unknown").ToString() : "0");
+        html.Append("</div><p><strong>Source:</strong> ").Append(E(Text(contract, "contract.source", "Not recorded"))).Append("; <strong>OpenAPI:</strong> ").Append(E(Text(contract, "contract.version", "Not recorded"))).Append("; <strong>Coverage:</strong> ").Append(E(Text(contract, "coverage.assessment", "unknown"))).Append("; <strong>Artifact:</strong> ").Append(ArtifactLink(reportDirectory, outputPath, "api-contract.json")).Append("</p><div class=\"table-wrap\"><table><thead><tr><th>Method</th><th>Path</th><th>Operation ID</th><th>Auth</th><th>Request body</th><th>Responses</th></tr></thead><tbody>");
+        if (operations.ValueKind == JsonValueKind.Array) foreach (var operation in operations.EnumerateArray())
+        {
+            var responseCount = operation.TryGetProperty("responses", out var responses) && responses.ValueKind == JsonValueKind.Array ? responses.GetArrayLength().ToString() : "0";
+            html.Append("<tr><th scope=\"row\">").Append(E(Text(operation, "method", ""))).Append("</th><td class=\"code\">").Append(E(Text(operation, "path", ""))).Append("</td><td>").Append(E(Text(operation, "operationId", "Not recorded"))).Append("</td><td>").Append(E(Text(operation, "authentication", "unknown"))).Append("</td><td>").Append(operation.TryGetProperty("requestBody", out var body) && body.ValueKind == JsonValueKind.Object ? "yes" : "no").Append("</td><td>").Append(E(responseCount)).Append("</td></tr>");
+        }
+        html.Append("</tbody></table></div></section>");
+    }
+
+    private static void AppendApiExecution(StringBuilder html, JsonElement execution, string reportDirectory, string outputPath)
+    {
+        if (execution.ValueKind != JsonValueKind.Object) return;
+        var active = Text(execution, "activeTesting", "false");
+        var aggregate = execution.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.Object ? summary : EmptyObject;
+        html.Append("<section aria-labelledby=\"api-execution-heading\"><h2 id=\"api-execution-heading\">Active API execution</h2><p class=\"muted\">Generated HTTP cases are bounded runtime evidence. Behavioral findings are presented separately.</p><div class=\"cards\">");
+        Card(html, "Active testing", active);
+        Card(html, "Target", Text(execution, "target.host", "Not recorded"));
+        Card(html, "Known operations", Text(aggregate, "known", "0"));
+        Card(html, "Requests", Text(aggregate, "requests", "0"));
+        Card(html, "Exercised", Text(aggregate, "exercised", "0"));
+        Card(html, "Auth limited", Text(aggregate, "authLimited", "0"));
+        Card(html, "Failed", Text(aggregate, "failed", "0"));
+        html.Append("</div><p><strong>Coverage:</strong> ").Append(E(Text(execution, "coverage.runtimeOperationCoverage", "unknown"))).Append("; <strong>Mode:</strong> ").Append(E(Text(execution, "mode", "Not recorded"))).Append("; <strong>Artifacts:</strong> ").Append(ArtifactLink(reportDirectory, outputPath, "api-execution.json")).Append(" ").Append(ArtifactLink(reportDirectory, outputPath, "raw/schemathesis.json")).Append("</p><div class=\"table-wrap\"><table><thead><tr><th>Operation</th><th>State</th><th>Cases</th><th>Completed</th><th>Candidate failures</th></tr></thead><tbody>");
+        if (execution.TryGetProperty("operations", out var operations) && operations.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var operation in operations.EnumerateArray())
+            {
+                html.Append("<tr><th scope=\"row\" class=\"code\">").Append(E(Text(operation, "operation", "Not recorded"))).Append("</th><td>").Append(E(Text(operation, "state", "unknown"))).Append("</td><td>").Append(E(Text(operation, "generatedCases", "0"))).Append("</td><td>").Append(E(Text(operation, "completedCases", "0"))).Append("</td><td>").Append(E(operation.TryGetProperty("candidateFailures", out var failures) && failures.ValueKind == JsonValueKind.Array ? failures.GetArrayLength().ToString() : "0")).Append("</td></tr>");
+            }
+        }
+        html.Append("</tbody></table></div></section>");
+    }
+
+    private static void AppendApiBehavior(StringBuilder html, JsonElement findings)
+    {
+        if (findings.ValueKind != JsonValueKind.Array) return;
+        var behavioral = findings.EnumerateArray().Where(item => Text(item, "category") == "api_behavior").ToArray();
+        if (behavioral.Length == 0) return;
+        html.Append("<section aria-labelledby=\"api-behavior-heading\"><h2 id=\"api-behavior-heading\">API behavioral findings</h2><p class=\"muted\">These findings are deterministic contract/runtime mismatches. They are not API baseline states yet.</p><div class=\"cards\">");
+        Card(html, "Behavioral findings", behavioral.Length.ToString());
+        Card(html, "Unexpected 5xx", behavioral.Count(item => Text(item, "type") == "unexpected_5xx").ToString());
+        Card(html, "Schema violations", behavioral.Count(item => Text(item, "type") == "response_schema_violation").ToString());
+        html.Append("</div><div class=\"table-wrap\"><table><thead><tr><th>Severity</th><th>Behavior</th><th>Operation</th><th>Observed</th><th>Examples</th></tr></thead><tbody>");
+        foreach (var finding in behavioral)
+        {
+            var evidence = finding.TryGetProperty("behaviorEvidence", out var value) && value.ValueKind == JsonValueKind.Object ? value : EmptyObject;
+            html.Append("<tr><th scope=\"row\">").Append(E(Text(finding, "severity", "unknown"))).Append("</th><td>").Append(E(Text(finding, "type", "unknown"))).Append("</td><td class=\"code\">").Append(E(Text(evidence, "operation", "Not recorded"))).Append("</td><td>").Append(E(JoinArray(evidence, "observedStatuses"))).Append("</td><td>").Append(E(Text(evidence, "retainedEvidenceCount", "0"))).Append("</td></tr>");
+        }
+        html.Append("</tbody></table></div></section>");
+    }
+
     private static void AppendFindings(StringBuilder html, JsonElement findings, JsonElement remediations, HashSet<string> blockingIds)
     {
         html.Append("<section id=\"findings\" aria-labelledby=\"findings-heading\"><h2 id=\"findings-heading\">Findings</h2><div class=\"toolbar\"><label>Search <input id=\"finding-search\" type=\"search\" placeholder=\"title, package, path, ID\"></label><label>Severity <select id=\"finding-severity\"><option value=\"\">All</option>");
@@ -245,6 +310,10 @@ internal static class ReportHtmlWriter
             html.Append("<dt>Evidence</dt><dd>").Append(IsHttpUrl(message) ? SafeLink(message) : E(message)).Append("</dd>");
             foreach (var key in new[] { "snippet", "sourceExcerpt", "lines" }) if (evidence.TryGetProperty(key, out var value)) html.Append("<dt>").Append(E(key)).Append("</dt><dd class=\"code\">").Append(E(Value(value))).Append("</dd>");
         }
+        if (finding.TryGetProperty("behaviorEvidence", out var behavior) && behavior.ValueKind == JsonValueKind.Object)
+        {
+            html.Append("<h4>Behavioral reproduction evidence</h4><div class=\"facts compact\"><div><strong>Operation</strong></div><div class=\"code\">").Append(E(Text(behavior, "operation", "Not recorded"))).Append("</div><div><strong>Expected statuses</strong></div><div>").Append(E(JoinArray(behavior, "expectedStatuses"))).Append("</div><div><strong>Observed statuses</strong></div><div>").Append(E(JoinArray(behavior, "observedStatuses"))).Append("</div><div><strong>Candidate occurrences</strong></div><div>").Append(E(Text(behavior, "candidateCount", "0"))).Append("; retained ").Append(E(Text(behavior, "retainedEvidenceCount", "0"))).Append("</div></div>");
+        }
         html.Append("</dl><h4>Scanner evidence</h4><ul>");
         if (finding.TryGetProperty("scannerEvidence", out var evidenceList) && evidenceList.ValueKind == JsonValueKind.Array) foreach (var evidenceItem in evidenceList.EnumerateArray()) html.Append("<li><strong>").Append(E(Text(evidenceItem, "scanner", "unknown"))).Append("</strong> ").Append(E(Text(evidenceItem, "nativeId", ""))).Append("<br>").Append(E(Text(evidenceItem, "nativeTitle", "Advisory title not recorded"))).Append("<br><span class=\"muted\">").Append(E(Text(evidenceItem, "nativeDescription", "Description not recorded"))).Append("</span></li>"); else html.Append("<li>Not recorded</li>");
         html.Append("</ul>");
@@ -263,7 +332,7 @@ internal static class ReportHtmlWriter
         Row(html, "Runner image digest", Text(scan, "runnerImageDigest", "Not recorded"), true);
         Row(html, "Ruleset / database metadata", Text(scan, "reproducibilityMetadata", "Not recorded"));
         html.Append("</tbody></table></div><p><strong>Artifacts:</strong> ");
-        foreach (var artifact in new[] { "project.json", "scan.json", "summary.json", "findings.json", "remediations.json", "components.json", "posture.json", "comparison.json" }) if (File.Exists(Path.Combine(reportDirectory, artifact))) html.Append(ArtifactLink(reportDirectory, outputPath, artifact)).Append(" ");
+        foreach (var artifact in new[] { "project.json", "scan.json", "summary.json", "findings.json", "remediations.json", "components.json", "api-contract.json", "api-execution.json", "posture.json", "comparison.json" }) if (File.Exists(Path.Combine(reportDirectory, artifact))) html.Append(ArtifactLink(reportDirectory, outputPath, artifact)).Append(" ");
         html.Append("</p></section>");
     }
 
